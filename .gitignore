@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.env
+warnings.json
+tickets.json
+dm_optin.json
+.vscode/
+.idea/
