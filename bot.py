@@ -231,9 +231,9 @@ intents.members = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
-WARN_FILE = "warnings.json"
+
 ROLES_FILE = "roles.json"
-TICKETS_FILE = "tickets.json"
+
 ALLOWED_ROLE_IDS: Set[int] = set()
 
 # Which commands are public for everyone
@@ -304,31 +304,7 @@ def parse_duration(s: str) -> Optional[timedelta]:
         return None
     return timedelta(days=d, hours=h, minutes=mins)
 
-def load_warnings() -> dict:
-    if not os.path.exists(WARN_FILE):
-        return {}
-    try:
-        with open(WARN_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
 
-def save_warnings(data: dict) -> None:
-    with open(WARN_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-def load_tickets() -> Dict[str, dict]:
-    if not os.path.exists(TICKETS_FILE):
-        return {}
-    try:
-        with open(TICKETS_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def save_tickets(data: Dict[str, dict]) -> None:
-    with open(TICKETS_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
 
 async def send_modlog(ctx: commands.Context, action: str, target: discord.abc.User, reason: str, extra: str = ""):
     if MODLOG_CHANNEL_ID <= 0:
