@@ -1,6 +1,7 @@
 # bot.py
 # Moderation bot with % prefix, role gate, custom help, Discohook posting, and a Ticket system with DM support.
 
+
 import os
 import json
 import re
@@ -18,6 +19,8 @@ DM_THROTTLE_SECONDS = 1.2   # delay between DMs
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+
+
 
 # ---------- Config ----------
 load_dotenv()
@@ -46,6 +49,30 @@ ALLOWED_ROLE_IDS: Set[int] = set()
 # Which commands are public for everyone
 PUBLIC_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus"}
 PUBLIC_DM_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus"}
+
+# top of file
+import os, asyncio
+from aiohttp import web
+
+# tiny health endpoint
+async def health(_):
+    return web.json_response({"ok": True})
+
+async def start_web():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8080"))  # Render sets PORT
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+    asyncio.create_task(start_web())  # start the HTTP server
+
 
 # ---------- Helpers ----------
 def now_utc() -> datetime:
