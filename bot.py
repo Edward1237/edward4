@@ -29,11 +29,11 @@ TICKETS_PING_ROLE_ID = int(os.getenv("TICKETS_PING_ROLE_ID", "0"))
 TICKETS_DELETE_AFTER_SEC = int(os.getenv("TICKETS_DELETE_AFTER_SEC", "5"))
 
 # Storage guild and channel ids, these are for the Discord storage backend
-STORAGE_GUILD_ID = int(os.getenv("STORAGE_GUILD_ID", "0"))
-STORAGE_WARN_CH_ID = int(os.getenv("STORAGE_WARN_CH_ID", "0"))
-STORAGE_TICKETS_CH_ID = int(os.getenv("STORAGE_TICKETS_CH_ID", "0"))
-STORAGE_OPTIN_CH_ID = int(os.getenv("STORAGE_OPTIN_CH_ID", "0"))
-STORAGE_BANS_CH_ID = int(os.getenv("STORAGE_BANS_CH_ID", "0"))
+STORAGE_GUILD_ID = int(os.getenv("STORAGE_GUILD_ID", "1412404656931606541"))
+STORAGE_WARN_CH_ID = int(os.getenv("STORAGE_WARN_CH_ID", "1412405374056796221"))
+STORAGE_TICKETS_CH_ID = int(os.getenv("STORAGE_TICKETS_CH_ID", "1412405423272628315"))
+STORAGE_OPTIN_CH_ID = int(os.getenv("STORAGE_OPTIN_CH_ID", "1412405448468070521"))
+STORAGE_BANS_CH_ID = int(os.getenv("STORAGE_BANS_CH_ID", "1412440601818960002"))
 
 # Instance labeling and gate
 INSTANCE = os.getenv("BOT_INSTANCE", "unknown")
