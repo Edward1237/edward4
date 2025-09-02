@@ -1182,20 +1182,18 @@ async def on_command_error(ctx: commands.Context, error):
         await ctx.reply(f"Error, {type(error).__name__}: {error}")
 
 # ---------- Start ----------
+# ---------- Start ----------
+import asyncio, contextlib
+
 async def main():
-    # start the tiny HTTP server first if you run as a Web Service on Render
-    web_task = asyncio.create_task(start_web())  # remove this line if you run as a Background Worker
+    web_task = asyncio.create_task(start_web())  # keep this only if you run a Web Service on Render
     try:
-        async with bot:  # ensures Discord client closes cleanly
+        async with bot:
             await bot.start(TOKEN)
     finally:
-        # stop the web task cleanly
         web_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await web_task
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Shutting down, keyboard interrupt")
+    asyncio.run(main())
