@@ -715,15 +715,7 @@ async def instance(ctx):
 async def ping(ctx: commands.Context):
     await ctx.reply(f"Hello {ctx.author.mention}, how can I help?")
 
-@bot.command(name="appeal", help="Open the appeal form, use this in DMs with the bot.")
-async def appeal(ctx: commands.Context):
-    if ctx.guild is not None:
-        await ctx.reply("Please DM me and run `%appeal` here so we keep it private.")
-        return
-    if _appeals_target_channel_id() <= 0 and not APPEALS_JOIN_INVITE:
-        await ctx.reply("Appeals channel is not configured, ask staff to set APPEALS_CHANNEL_ID or MODLOG_CHANNEL_ID.")
-        return
-    await ctx.reply("Tap the button to open the appeal form.", ())
+
 
 
 
