@@ -1289,6 +1289,35 @@ async def dmpreview(ctx: commands.Context, *, message: str):
 
 # ---------- Help and errors ----------
 
+def _command_usage(cmd: commands.Command) -> str:
+    return f"{PREFIX}{cmd.qualified_name} {cmd.usage}" if cmd.usage else f"{PREFIX}{cmd.qualified_name}"
+
+def _visible_commands() -> list[commands.Command]:
+    return sorted([c for c in bot.commands if not c.hidden], key=lambda c: c.qualified_name)
+
+def _build_help_pages(page_size: int = 20) -> list[discord.Embed]:
+    cmds = _visible_commands()
+    pages: list[discord.Embed] = []
+    page = discord.Embed(title="Edward Bot help")
+    count = 0
+
+    for cmd in cmds:
+        page.add_field(name=_command_usage(cmd), value=cmd.help or "No description", inline=False)
+        count += 1
+        if count >= page_size:
+            pages.append(page)
+            page = discord.Embed(title="Edward Bot help, continued")
+            count = 0
+
+    if len(page.fields) > 0:
+        pages.append(page)
+
+    if len(pages) > 1:
+        for i, emb in enumerate(pages, start=1):
+            emb.set_footer(text=f"Page {i} of {len(pages)}")
+
+    return pages
+
 @bot.command(name="help", usage="[command]", help="Show this help, or details for one command.")
 async def help_cmd(ctx: commands.Context, command_name: Optional[str] = None):
     if command_name:
@@ -1296,22 +1325,18 @@ async def help_cmd(ctx: commands.Context, command_name: Optional[str] = None):
         if not cmd or cmd.hidden:
             await ctx.reply("That command does not exist.")
             return
-        usage = f"{PREFIX}{cmd.qualified_name} {cmd.usage}" if cmd.usage else f"{PREFIX}{cmd.qualified_name}"
         emb = discord.Embed(title=f"Help, {cmd.qualified_name}")
-        emb.add_field(name="Usage", value=usage, inline=False)
+        emb.add_field(name="Usage", value=_command_usage(cmd), inline=False)
         if cmd.help:
             emb.add_field(name="Description", value=cmd.help, inline=False)
         if cmd.aliases:
             emb.add_field(name="Aliases", value=", ".join(cmd.aliases), inline=False)
         await ctx.reply(embed=emb)
         return
-    emb = discord.Embed(title="Edward Bot help")
-    for c in sorted(bot.commands, key=lambda x: x.qualified_name):
-        if c.hidden:
-            continue
-        usage = f"{PREFIX}{c.qualified_name} {c.usage}" if c.usage else f"{PREFIX}{c.qualified_name}"
-        emb.add_field(name=usage, value=c.help or "No description", inline=False)
-    await ctx.reply(embed=emb)
+
+    for emb in _build_help_pages(page_size=20):
+        await ctx.reply(embed=emb)
+
 
 @bot.command(name="reloadroles", help="Reload roles.json from disk. Owner only.")
 async def reloadroles(ctx: commands.Context):
