@@ -8,6 +8,11 @@ import re
 import asyncio
 # at top with other imports
 import io
+import os
+import asyncio
+from aiohttp import web
+import contextlib
+
 
 from datetime import timedelta, datetime, timezone
 from typing import Optional, Tuple, Set, Dict
@@ -54,7 +59,6 @@ PUBLIC_DM_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus"}
 import os, asyncio
 from aiohttp import web
 
-# tiny health endpoint
 async def health(_):
     return web.json_response({"ok": True})
 
@@ -65,13 +69,10 @@ async def start_web():
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.getenv("PORT", "8080"))  # Render sets PORT
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    site = web.TCPSite(runner, "0.0.0.0", port)  # must be 0.0.0.0, not 127.0.0.1
     await site.start()
+    print(f"[web] listening on {port}")
 
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}")
-    asyncio.create_task(start_web())  # start the HTTP server
 
 
 # ---------- Helpers ----------
@@ -1019,7 +1020,28 @@ async def on_command_error(ctx: commands.Context, error):
         await ctx.reply(f"Error, {type(error).__name__}: {error}")
 
 # ---------- Start ----------
+async def main():
+    # start the HTTP server before logging in, Render will see an open port
+    asyncio.create_task(start_web())
+    await bot.start(TOKEN)
+
 if __name__ == "__main__":
-    if not TOKEN or TOKEN == "YOUR_TOKEN_HERE":
-        print("Set DISCORD_TOKEN in your .env file.")
-    bot.run(TOKEN)
+    asyncio.run(main())
+
+async def main():
+    # start the tiny HTTP server first if you run as a Web Service on Render
+    web_task = asyncio.create_task(start_web())  # remove this line if you run as a Background Worker
+    try:
+        async with bot:  # ensures Discord client closes cleanly
+            await bot.start(TOKEN)
+    finally:
+        # stop the web task cleanly
+        web_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await web_task
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Shutting down, keyboard interrupt")
