@@ -223,13 +223,6 @@ bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 # label this running copy
 INSTANCE = os.getenv("BOT_INSTANCE", "unknown")
 
-@bot.command()
-async def instance(ctx):
-    await ctx.reply(f"Instance, {INSTANCE}")
-
-@bot.command(name="ping", help="Say hello.")
-async def ping(ctx: commands.Context):
-    await ctx.reply(f"Hello {ctx.author.mention}, how can I help?")
 
 
 
@@ -513,6 +506,19 @@ async def on_ready():
     asyncio.create_task(storage_bootstrap())
 
 # ---------- Moderation Commands ----------
+@bot.command()
+async def instance(ctx):
+    await ctx.reply(f"Instance, {INSTANCE}")
+
+@bot.command(name="ping", help="Say hello.")
+async def ping(ctx: commands.Context):
+    await ctx.reply(f"Hello {ctx.author.mention}, how can I help?")
+
+
+
+
+
+
 @bot.command(usage="@user reason", help="Ban a user, then DM them the reason.")
 @commands.has_permissions(ban_members=True)
 @commands.bot_has_permissions(ban_members=True)
