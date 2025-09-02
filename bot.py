@@ -1,71 +1,73 @@
 # bot.py
-# Moderation bot with percent prefix, role gate, discohook posting, ticket system, bulk DMs, DM appeal flow, and Discord based JSON storage
+# Moderation bot with percent prefix, role gate, ticket system, discohook posting,
+# bulk DMs with opt in, Discord based JSON storage, DM appeal flow with server validation,
+# and a tiny web server for Render health checks.
 
-import os, io, re, json, asyncio, contextlib, time
+import os, io, re, json, asyncio, contextlib
 from datetime import timedelta, datetime, timezone
-from typing import Optional, Tuple, Set, Dict, Iterable
+from typing import Optional, Tuple, Set, Dict, Iterable, Callable
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 from aiohttp import web
 
-# ---------- Config and startup basics ----------
+# ---------- Load env and core config ----------
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 
 PREFIX = "%"
-MODLOG_CHANNEL_ID = int(os.getenv("MODLOG_CHANNEL_ID", "1378831049907245121"))
+MODLOG_CHANNEL_ID = int(os.getenv("MODLOG_CHANNEL_ID", "0"))
 
-# Appeals, optional invite to a separate server
-APPEALS_CHANNEL_ID = int(os.getenv("APPEALS_CHANNEL_ID", "1378831049907245121"))
+# Appeals
+APPEALS_CHANNEL_ID = int(os.getenv("APPEALS_CHANNEL_ID", "1378831049907245121"))  # falls back to MODLOG if 0
 APPEALS_JOIN_INVITE = os.getenv("APPEALS_JOIN_INVITE", "")
 
-# Ticket env
+# Ticket config
 TICKETS_GUILD_ID = int(os.getenv("TICKETS_GUILD_ID", "0"))
 TICKETS_CATEGORY_ID = int(os.getenv("TICKETS_CATEGORY_ID", "0"))
 TICKETS_PING_ROLE_ID = int(os.getenv("TICKETS_PING_ROLE_ID", "0"))
 TICKETS_DELETE_AFTER_SEC = int(os.getenv("TICKETS_DELETE_AFTER_SEC", "5"))
 
-# Storage guild and channel ids, these are for the Discord storage backend
+# Storage guild and channel ids, used for JSON blobs stored as message attachments
 STORAGE_GUILD_ID = int(os.getenv("STORAGE_GUILD_ID", "1412404656931606541"))
 STORAGE_WARN_CH_ID = int(os.getenv("STORAGE_WARN_CH_ID", "1412405374056796221"))
 STORAGE_TICKETS_CH_ID = int(os.getenv("STORAGE_TICKETS_CH_ID", "1412405423272628315"))
 STORAGE_OPTIN_CH_ID = int(os.getenv("STORAGE_OPTIN_CH_ID", "1412405448468070521"))
 STORAGE_BANS_CH_ID = int(os.getenv("STORAGE_BANS_CH_ID", "1412440601818960002"))
 
-# Instance labeling and gate
+# Instance labeling and single instance gate
 INSTANCE = os.getenv("BOT_INSTANCE", "unknown")
-ALLOWED_INSTANCE = os.getenv("ALLOWED_INSTANCE", "")  # set to render on the service you keep
+ALLOWED_INSTANCE = os.getenv("ALLOWED_INSTANCE", "")  # set to render on the one service you keep
 
-# Throttle for bulk DMs
-DM_THROTTLE_SECONDS = 1.2
-
-# Role file for the role gate
+# Role gate file
 ROLES_FILE = "roles.json"
 
-# Public commands allowed for everyone, both in guild and in DM
+# Bulk DM settings
+DM_THROTTLE_SECONDS = 1.2
+
+# Public commands
 PUBLIC_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus", "ping", "appeal"}
 PUBLIC_DM_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus", "ping", "appeal"}
 
-# Discord intents and bot
+# ---------- Discord client ----------
+
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
-# Only the allowed instance handles commands, if ALLOWED_INSTANCE is unset everyone is allowed
 @bot.check_once
 async def single_instance_gate(_ctx):
     return not ALLOWED_INSTANCE or INSTANCE == ALLOWED_INSTANCE
 
-# Handy ping
 @bot.command()
 async def instance(ctx):
     await ctx.reply(f"Instance, {INSTANCE}")
 
-# Tiny HTTP server for Render Web Service health checks
+# ---------- Tiny web server for Render ----------
+
 async def health(_):
     return web.json_response({"ok": True})
 
@@ -80,7 +82,7 @@ async def start_web():
     await site.start()
     print(f"[web] listening on {port}")
 
-# ---------- Discord storage in a different server ----------
+# ---------- Discord storage backend, JSON in channels ----------
 
 _WARN_CACHE: dict = {}
 _TICKETS_CACHE: dict = {}
@@ -97,13 +99,12 @@ def _storage_targets() -> list[Tuple[str, int]]:
     ]
 
 def _cache_for(name: str) -> dict:
-    mapping = {
+    return {
         "warnings": _WARN_CACHE,
         "tickets": _TICKETS_CACHE,
         "dm_optin": _OPTIN_CACHE,
         "bans": _BANS_CACHE,
-    }
-    return mapping.get(name, {})
+    }[name]
 
 async def _get_text_channel(cid: int) -> Optional[discord.TextChannel]:
     ch = bot.get_channel(cid)
@@ -200,17 +201,40 @@ async def storage_bootstrap():
         _storage_ready.set()
 
 def _schedule_save(name: str, cid: int):
-    data = _cache_for(name)
     if cid:
-        asyncio.create_task(_save_one(name, cid, data))
+        asyncio.create_task(_save_one(name, cid, _cache_for(name)))
+
+def _normalize_warnings(raw: object) -> dict:
+    if not isinstance(raw, dict):
+        return {}
+    out: dict = {}
+    for gk, gv in raw.items():
+        if not isinstance(gv, dict):
+            continue
+        users: dict = {}
+        for uk, uv in gv.items():
+            if isinstance(uv, list):
+                users[str(uk)] = [e for e in uv if isinstance(e, dict)]
+            else:
+                users[str(uk)] = []
+        out[str(gk)] = users
+    return out
 
 def load_warnings() -> dict:
-    return _WARN_CACHE or {}
+    return _normalize_warnings(_WARN_CACHE or {})
 
 def save_warnings(data: dict) -> None:
+    cleaned = _normalize_warnings(data)
     _WARN_CACHE.clear()
-    _WARN_CACHE.update(data)
+    _WARN_CACHE.update(cleaned)
     _schedule_save("warnings", STORAGE_WARN_CH_ID)
+
+def _get_warn_bucket(data: dict, gkey: str, ukey: str) -> list:
+    if gkey not in data or not isinstance(data[gkey], dict):
+        data[gkey] = {}
+    if ukey not in data[gkey] or not isinstance(data[gkey][ukey], list):
+        data[gkey][ukey] = []
+    return data[gkey][ukey]
 
 def load_tickets() -> dict:
     return _TICKETS_CACHE or {}
@@ -336,31 +360,72 @@ async def on_ready():
     print(f"Logged in as {bot.user}, prefix {PREFIX}, instance {INSTANCE}")
     asyncio.create_task(storage_bootstrap())
 
-# ---------- Appeal, DM interview with pretty embeds ----------
-
-_APPEAL_BUSY: set[int] = set()
-
-# --- Appeal helpers, smarter flow with validation and ban discovery ---
+# ---------- Appeal, strict DM interview with server validation ----------
 
 ALLOWED_APPEAL_ACTIONS = {"ban", "mute", "warn", "kick", "other"}
+_APPEAL_BUSY: set[int] = set()
 
 def _normalize_action(text: str) -> Optional[str]:
     s = (text or "").lower().strip()
     aliases = {
-        "banned": "ban", "perma": "ban", "perm": "ban",
+        "banned": "ban", "perm": "ban", "perma": "ban",
         "timeout": "mute", "timed out": "mute", "time out": "mute", "silence": "mute",
         "warning": "warn", "warned": "warn",
         "kicked": "kick",
+        "other": "other",
     }
     if s in ALLOWED_APPEAL_ACTIONS:
         return s
     return aliases.get(s)
 
+async def _find_bans_for_user(user_id: int) -> list[dict]:
+    found: list[dict] = []
+    data = load_bans()
+    for rec in data.get(str(user_id), []):
+        if not rec.get("unbanned", False):
+            found.append(rec)
+    # live check
+    try:
+        u = await bot.fetch_user(user_id)
+    except Exception:
+        u = discord.Object(id=user_id)  # type: ignore
+    for g in bot.guilds:
+        me = g.me
+        if not me or not getattr(me.guild_permissions, "ban_members", False):
+            continue
+        with contextlib.suppress(Exception):
+            be = await g.fetch_ban(u)
+            found.append({
+                "guild_id": g.id, "guild_name": g.name,
+                "reason": be.reason or "No reason recorded",
+                "when": now_utc().isoformat(), "unbanned": False
+            })
+    # recent first
+    return list(reversed(found))
+
+async def _mutual_or_banned_guilds(user_id: int) -> list[dict]:
+    """Return list of entries, each has id, name, status, reason optional."""
+    choices: dict[int, dict] = {}
+    # mutual membership
+    for g in bot.guilds:
+        with contextlib.suppress(Exception):
+            m = await g.fetch_member(user_id)
+            if m:
+                choices[g.id] = {"id": g.id, "name": g.name, "status": "member"}
+    # banned places
+    for rec in await _find_bans_for_user(user_id):
+        gid = int(rec.get("guild_id", 0))
+        if gid and gid not in choices:
+            choices[gid] = {"id": gid, "name": rec.get("guild_name", "unknown"), "status": "banned", "reason": rec.get("reason", "")}
+        elif gid in choices:
+            choices[gid]["status"] = "banned"  # prefer banned label if both
+            choices[gid]["reason"] = rec.get("reason", "")
+    return list(choices.values())
+
 async def _ask_until_valid(dm: discord.DMChannel, title: str, prompt: str,
                            required: bool = True,
-                           validate: Optional[callable] = None,
+                           validate: Optional[Callable[[str], bool]] = None,
                            timeout_sec: int = 240) -> Optional[str]:
-    """Ask with a nice embed, wait, validate, loop until valid or cancel or timeout."""
     while True:
         emb = discord.Embed(title=title, description=prompt, color=discord.Color.blurple())
         emb.set_footer(text="Type cancel to stop at any time")
@@ -390,51 +455,13 @@ async def _ask_until_valid(dm: discord.DMChannel, title: str, prompt: str,
             await dm.send("That step is required, please try again.")
             continue
 
-        if validate:
-            ok = validate(content)
-            if not ok:
-                await dm.send("Please answer with a valid value, try again.")
-                continue
+        if validate and not validate(content):
+            await dm.send("Please answer with a valid value, try again.")
+            continue
 
         return content
 
-async def _find_bans_for_user(user_id: int) -> list[dict]:
-    """Return a list of ban records, newest first. Uses storage first, then live fetch."""
-    found: list[dict] = []
-
-    # storage
-    data = load_bans()
-    for rec in data.get(str(user_id), []):
-        if not rec.get("unbanned", False):
-            found.append(rec)
-
-    # live, ask every guild where we likely have permission
-    for g in bot.guilds:
-        me = g.me
-        if not me or not getattr(me.guild_permissions, "ban_members", False):
-            continue
-        try:
-            # both user object and light object are fine
-            u = await bot.fetch_user(user_id)
-        except Exception:
-            u = discord.Object(id=user_id)  # type: ignore
-        try:
-            ban_entry = await g.fetch_ban(u)
-        except Exception:
-            continue
-        found.append({
-            "guild_id": g.id,
-            "guild_name": g.name,
-            "reason": ban_entry.reason or "No reason recorded",
-            "when": now_utc().isoformat(),
-            "unbanned": False,
-        })
-
-    # newest last in storage, so reverse makes newest first overall
-    return list(reversed(found))
-
-async def _dm_interview_pretty(user: discord.User) -> tuple[bool, dict, list[str]]:
-    """Ask questions in DM with embeds, validate action, collect optional attachments."""
+async def _dm_interview_appeal(user: discord.User) -> tuple[bool, dict, list[str]]:
     try:
         dm = await user.create_dm()
     except Exception:
@@ -451,57 +478,73 @@ async def _dm_interview_pretty(user: discord.User) -> tuple[bool, dict, list[str
         await asyncio.sleep(1)
         await head.delete()
 
-    answers: dict = {}
-    attach_urls: list[str] = []
+    # Build server list the bot can verify
+    choices = await _mutual_or_banned_guilds(user.id)
 
-    # try to detect likely servers where the user is banned
-    bans = await _find_bans_for_user(user.id)
-    if bans:
-        summary = "\n".join(f"• {b['guild_name']}  id {b['guild_id']}, reason, {b.get('reason','No reason recorded')}" for b in bans[:5])
-        await dm.send(embed=discord.Embed(
-            title="I found possible bans for you",
-            description=summary,
-            color=discord.Color.orange()
-        ))
+    if not choices:
+        await dm.send("I could not find any server you share with me or a visible ban. You can still describe the server name in the next step.")
 
-    # action, validated
+    # Ask for server choice if we have choices
+    selected_guild: Optional[dict] = None
+    if choices:
+        listing = "\n".join(f"{i}. {c['name']}  [{c['status']}]" + (f", reason, {c.get('reason')}" if c.get("reason") else "")
+                            for i, c in enumerate(choices, start=1))
+        await dm.send(embed=discord.Embed(title="Server choice", description=listing, color=discord.Color.orange()))
+        def _valid_index(s: str) -> bool:
+            if not s.isdigit():
+                return False
+            k = int(s)
+            return 1 <= k <= len(choices)
+        pick = await _ask_until_valid(dm, "Step 1", "Reply with the number of the server, or type 0 to skip", required=True,
+                                      validate=lambda s: s == "0" or _valid_index(s))
+        if pick is None:
+            return False, {}, []
+        if pick != "0":
+            selected_guild = choices[int(pick) - 1]
+
+    # If skipped or no choices, ask for free text server claim, but keep trying to map to a real guild if possible
+    server_claim = ""
+    if selected_guild is None:
+        server_claim = await _ask_until_valid(dm, "Step 1", "Which server is this about, type the name or id, you can paste an invite if you want",
+                                              required=False)
+        server_claim = server_claim or ""
+
+        # try to match by id or name
+        if server_claim.isdigit():
+            gid = int(server_claim)
+            for g in bot.guilds:
+                if g.id == gid:
+                    selected_guild = {"id": g.id, "name": g.name, "status": "unknown"}
+                    break
+        if selected_guild is None and server_claim:
+            for g in bot.guilds:
+                if g.name.lower() == server_claim.lower():
+                    selected_guild = {"id": g.id, "name": g.name, "status": "unknown"}
+                    break
+
+    # Validate action with a whitelist
     def _valid_action(s: str) -> bool:
         return bool(_normalize_action(s))
-    action = await _ask_until_valid(dm, "Step 1",
-                                    "What action are you appealing, type one, ban, mute, warn, kick, or other",
+    action = await _ask_until_valid(dm, "Step 2", "What action are you appealing, type one, ban, mute, warn, kick, or other",
                                     required=True, validate=_valid_action)
     if action is None:
         return False, {}, []
-    answers["action"] = _normalize_action(action) or "other"
+    action = _normalize_action(action) or "other"
 
-    # server, optional free text, the embed will also include auto detected bans
-    server = await _ask_until_valid(dm, "Step 2", "Which server is this about, optional, you can paste the name or id",
-                                    required=False, validate=None)
-    answers["server_claim"] = server or ""
-
-    # what happened, required
-    what = await _ask_until_valid(dm, "Step 3", "What happened, please give details",
-                                  required=True, validate=None)
+    what = await _ask_until_valid(dm, "Step 3", "What happened, please give details", required=True)
     if what is None:
         return False, {}, []
-    answers["what"] = what
-
-    # why reconsider, required
-    why = await _ask_until_valid(dm, "Step 4", "Why should staff reconsider, please be clear and respectful",
-                                 required=True, validate=None)
+    why = await _ask_until_valid(dm, "Step 4", "Why should staff reconsider, please be clear and respectful", required=True)
     if why is None:
         return False, {}, []
-    answers["why"] = why
 
-    # evidence links or files, optional, capture attachment urls too
-    prompt = "Links to evidence, optional, you can also attach files, send an empty message to skip"
-    emb = discord.Embed(title="Step 5", description=prompt, color=discord.Color.blurple())
+    # Evidence links or files, optional
+    emb = discord.Embed(title="Step 5", description="Links to evidence, optional, you can also attach files, send an empty message to skip",
+                        color=discord.Color.blurple())
     emb.set_footer(text="Type cancel to stop at any time")
     box = await dm.send(embed=emb)
-
     def check(m: discord.Message) -> bool:
         return m.author.id == user.id and m.channel.id == dm.id
-
     try:
         msg = await bot.wait_for("message", check=check, timeout=240)
     except asyncio.TimeoutError:
@@ -512,24 +555,32 @@ async def _dm_interview_pretty(user: discord.User) -> tuple[bool, dict, list[str
     with contextlib.suppress(Exception):
         await box.delete()
 
-    answers["evidence"] = msg.content.strip()
+    evidence = msg.content.strip()
+    attach_urls: list[str] = []
     for a in msg.attachments:
         with contextlib.suppress(Exception):
             attach_urls.append(a.url)
 
     await dm.send("Thanks, your appeal was recorded. You can delete your replies here if you want extra privacy.")
-    return True, answers | {"auto_bans": bans}, attach_urls
+
+    answers = {
+        "server": selected_guild,            # dict or None
+        "server_claim": server_claim,        # text, may be ""
+        "action": action,
+        "what": what,
+        "why": why,
+        "evidence": evidence,
+    }
+    return True, answers, attach_urls
 
 @bot.command(name="appeal", help="Start an appeal interview in DMs, then send it to the staff channel.")
 async def appeal(ctx: commands.Context):
-    ch_id = APPEALS_CHANNEL_ID if APPEALS_CHANNEL_ID > 0 else MODLOG_CHANNEL_ID
+    ch_id = _appeals_target_channel_id()
     if ch_id <= 0:
         await ctx.reply("Appeals channel is not configured. Ask staff to set APPEALS_CHANNEL_ID or MODLOG_CHANNEL_ID.")
         return
 
     author = ctx.author
-
-    # move to DM if they start it in a server
     if ctx.guild is not None:
         try:
             await author.send("Hi, I will collect your appeal here in DM.")
@@ -538,7 +589,6 @@ async def appeal(ctx: commands.Context):
             await ctx.reply("I cannot DM you. Enable DMs from server members, then try again." + extra)
             return
 
-    # prevent double runs
     if author.id in _APPEAL_BUSY:
         if ctx.guild is None:
             await ctx.reply("You already have an active appeal. Finish that one first.")
@@ -548,27 +598,31 @@ async def appeal(ctx: commands.Context):
     _APPEAL_BUSY.add(author.id)
 
     try:
-        ok, answers, attach_urls = await _dm_interview_pretty(author)
+        ok, answers, attach_urls = await _dm_interview_appeal(author)
         if not ok:
             return
 
-        bans = answers.pop("auto_bans", [])
-        action = answers.get("action", "other")
-        server_claim = answers.get("server_claim", "")
+        server_info = answers.get("server")
+        bans = await _find_bans_for_user(author.id)
 
-        # build staff embed, avoid Embed.Empty to fix your error
         emb = discord.Embed(
             title="New appeal",
             description="A user submitted an appeal",
             color=discord.Color.orange(),
             timestamp=now_utc()
         )
-        # use a real URL or None, no Embed.Empty here
         emb.set_author(name=str(author), icon_url=getattr(author.display_avatar, "url", None))
         emb.add_field(name="User", value=f"{author.mention}  ({author.id})", inline=False)
-        emb.add_field(name="Action", value=action, inline=False)
-        if server_claim:
-            emb.add_field(name="Server, claimed", value=server_claim[:256], inline=False)
+        emb.add_field(name="Action", value=answers.get("action", "other"), inline=False)
+
+        if server_info:
+            val = f"{server_info['name']}  id {server_info['id']}  status {server_info.get('status','unknown')}"
+            if server_info.get("reason"):
+                val += f"\nReason, {server_info['reason']}"
+            emb.add_field(name="Server, selected", value=val[:1024], inline=False)
+        elif answers.get("server_claim"):
+            emb.add_field(name="Server, user claim", value=answers["server_claim"][:256], inline=False)
+
         emb.add_field(name="What happened", value=(answers.get("what") or "")[:1024], inline=False)
         emb.add_field(name="Why reconsider", value=(answers.get("why") or "")[:1024], inline=False)
 
@@ -577,7 +631,6 @@ async def appeal(ctx: commands.Context):
             if ev:
                 emb.add_field(name="Evidence", value=ev[:1024], inline=False)
 
-        # include any auto detected bans
         if bans:
             summary = "\n".join(f"• {b['guild_name']}  id {b['guild_id']}, reason, {b.get('reason','No reason recorded')}" for b in bans[:5])
             emb.add_field(name="Auto detected bans", value=summary[:1024], inline=False)
@@ -607,8 +660,7 @@ async def appeal(ctx: commands.Context):
     finally:
         _APPEAL_BUSY.discard(author.id)
 
-
-# ---------- Moderation Commands ----------
+# ---------- Moderation commands ----------
 
 @bot.command(name="ping", help="Say hello.")
 async def ping(ctx: commands.Context):
@@ -717,23 +769,20 @@ async def warn(ctx: commands.Context, member: discord.Member, *, reason: Optiona
     data = load_warnings()
     gkey = str(ctx.guild.id)
     ukey = str(member.id)
-    data.setdefault(gkey, {}).setdefault(ukey, [])
+    bucket = _get_warn_bucket(data, gkey, ukey)
     entry = {"reason": reason or "No reason provided", "moderator_id": ctx.author.id, "timestamp": now_utc().isoformat()}
-    data[gkey][ukey].append(entry)
+    bucket.append(entry)
     save_warnings(data)
     dm_ok = await try_dm_after_action(member, f"Warning in {ctx.guild.name}", entry["reason"], ctx.author)
     note = "DM sent" if dm_ok else "DM could not be delivered"
-    count = len(data[gkey][ukey])
-    await ctx.reply(f"Issued warning to {member} , total warnings, {count}. {note}.")
-    await send_modlog(ctx, "Warn", member, entry["reason"], extra=f"Total warnings, {count}")
+    await ctx.reply(f"Issued warning to {member} , total warnings, {len(bucket)}. {note}.")
+    await send_modlog(ctx, "Warn", member, entry["reason"], extra=f"Total warnings, {len(bucket)}")
 
 @bot.command(name="warns", aliases=["warnings"], usage="@user", help="Show warnings for a user.")
 @commands.has_permissions(manage_messages=True)
 async def warns(ctx: commands.Context, member: discord.Member):
     data = load_warnings()
-    gkey = str(ctx.guild.id)
-    ukey = str(member.id)
-    records = data.get(gkey, {}).get(ukey, [])
+    records = data.get(str(ctx.guild.id), {}).get(str(member.id), [])
     if not records:
         await ctx.reply(f"{member.display_name} has no warnings.")
         return
@@ -757,7 +806,7 @@ async def clearwarns(ctx: commands.Context, member: discord.Member, count: str):
         return
     if count.lower() == "all":
         cleared = len(records)
-        data[gkey][ukey] = []
+        _get_warn_bucket(data, gkey, ukey)[:] = []
     else:
         try:
             n = int(count)
@@ -768,7 +817,7 @@ async def clearwarns(ctx: commands.Context, member: discord.Member, count: str):
             await ctx.reply("Provide a number, or use the word all.")
             return
         cleared = min(n, len(records))
-        data[gkey][ukey] = records[cleared:]
+        _get_warn_bucket(data, gkey, ukey)[:] = records[cleared:]
     save_warnings(data)
     await ctx.reply(f"Cleared {cleared} warning(s) for {member.display_name}.")
     await send_modlog(ctx, "Clear Warnings", member, f"Cleared {cleared} warning(s)")
@@ -918,12 +967,9 @@ def parse_discohook_payload(payload: dict) -> tuple[str, list[discord.Embed], Op
     view = _to_view(base.get("components") or [])
     return content, embeds, view
 
-@bot.command(
-    name="discopost",
-    aliases=["discohook", "postjson"],
-    usage="channel_id [attach a .json or paste JSON]",
-    help="Post a message from a Discohook JSON without a webhook."
-)
+@bot.command(name="discopost", aliases=["discohook", "postjson"],
+             usage="channel_id [attach a .json or paste JSON]",
+             help="Post a message from a Discohook JSON without a webhook.")
 @commands.has_permissions(manage_messages=True)
 async def discopost(ctx: commands.Context, channel_id: int, *, json_text: Optional[str] = None):
     channel = ctx.guild.get_channel(channel_id)
@@ -955,7 +1001,7 @@ async def discopost(ctx: commands.Context, channel_id: int, *, json_text: Option
         await channel.send(content=content or None, embeds=embeds or None, view=view, allowed_mentions=discord.AllowedMentions.none())
     await ctx.reply(f"Sent to <#{channel.id}>.")
 
-# ---------- Ticket System ----------
+# ---------- Ticket system ----------
 
 def ticket_name_for(user: discord.abc.User) -> str:
     suffix = str(user.id)[-4:]
@@ -1058,41 +1104,7 @@ async def ticket_cmd(ctx: commands.Context, *, reason: Optional[str] = None):
         with contextlib.suppress(Exception):
             await ctx.author.send(f"Your ticket has been created, {link}")
 
-@bot.command(name="close", usage="[reason]", help="Close the current ticket channel. Staff and the opener can use this in a ticket.")
-async def close_cmd(ctx: commands.Context, *, reason: Optional[str] = None):
-    if ctx.guild is None or not isinstance(ctx.channel, discord.TextChannel):
-        return
-    reg = load_tickets()
-    info = reg.get(str(ctx.channel.id))
-    if not info or info.get("closed"):
-        await ctx.reply("This is not an active ticket channel.")
-        return
-    opener_id = info.get("opener_id")
-    is_staff = any(r.id in ALLOWED_ROLE_IDS for r in getattr(ctx.author, "roles", []))
-    is_opener = ctx.author.id == opener_id
-    is_owner = ctx.author == ctx.guild.owner
-    if not (is_staff or is_opener or is_owner):
-        await ctx.reply("Only staff or the ticket opener can close this ticket.")
-        return
-    info["closed"] = True
-    info["closed_at"] = now_utc().isoformat()
-    info["close_reason"] = reason or "No reason provided"
-    reg[str(ctx.channel.id)] = info
-    save_tickets(reg)
-    embed = discord.Embed(title="Ticket closed", description=info["close_reason"])
-    embed.add_field(name="Closed by", value=str(ctx.author), inline=False)
-    with contextlib.suppress(Exception):
-        await ctx.reply(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-    delay = max(0, TICKETS_DELETE_AFTER_SEC)
-    try:
-        await asyncio.sleep(delay)
-        await ctx.channel.delete(reason=f"Ticket closed by {ctx.author}")
-    except discord.Forbidden:
-        await ctx.send("I do not have permission to delete this channel.")
-    except discord.HTTPException:
-        pass
-
-# ---------- Bulk DM helpers ----------
+# ---------- Bulk DM, opt in ----------
 
 def _get_guild_for(ctx: commands.Context) -> Optional[discord.Guild]:
     if ctx.guild:
@@ -1153,6 +1165,47 @@ async def _bulk_dm_send(ctx: commands.Context, targets: Iterable[discord.Member]
                 await progress.edit(content=f"Sending, {sent} sent, {failed} failed, {skipped} skipped.")
     with contextlib.suppress(Exception):
         await progress.edit(content=f"Done, {sent} sent, {failed} failed, {skipped} skipped.")
+
+@bot.command(help="Opt in to receive server DMs from staff. Works in server or DM.")
+async def dmoptin(ctx: commands.Context):
+    guild = _get_guild_for(ctx)
+    if not guild:
+        await ctx.reply("No target server configured.")
+        return
+    data = _load_optins()
+    g = data.setdefault(str(guild.id), {"users": []})
+    if ctx.author.id in g["users"]:
+        await ctx.reply("You are already opted in.")
+        return
+    g["users"].append(ctx.author.id)
+    _save_optins(data)
+    await ctx.reply(f"Opt in saved for {guild.name}.")
+
+@bot.command(help="Opt out of server DMs. Works in server or DM.")
+async def dmoptout(ctx: commands.Context):
+    guild = _get_guild_for(ctx)
+    if not guild:
+        await ctx.reply("No target server configured.")
+        return
+    data = _load_optins()
+    g = data.setdefault(str(guild.id), {"users": []})
+    if ctx.author.id in g["users"]:
+        g["users"].remove(ctx.author.id)
+        _save_optins(data)
+        await ctx.reply(f"Opt out saved for {guild.name}.")
+    else:
+        await ctx.reply("You are not opted in.")
+
+@bot.command(help="Show whether you are opted in to bulk DMs.")
+async def dmstatus(ctx: commands.Context):
+    guild = _get_guild_for(ctx)
+    if not guild:
+        await ctx.reply("No target server configured.")
+        return
+    data = _load_optins()
+    g = data.get(str(guild.id), {"users": []})
+    status = "opted in" if ctx.author.id in g.get("users", []) else "opted out"
+    await ctx.reply(f"You are {status} for {guild.name}.")
 
 @bot.command(name="dmall", usage="message, supports {user}, {mention}, {guild}, attachments optional", help="DM all opted in members of this server.")
 @commands.has_permissions(manage_messages=True)
@@ -1215,7 +1268,7 @@ async def dmpreview(ctx: commands.Context, *, message: str):
     sample = _format_placeholders(message, guild, ctx.author)
     await ctx.reply(f"Preview:\n{sample}")
 
-# ---------- Custom help ----------
+# ---------- Help and errors ----------
 
 @bot.command(name="help", usage="[command]", help="Show this help, or details for one command.")
 async def help_cmd(ctx: commands.Context, command_name: Optional[str] = None):
@@ -1241,7 +1294,6 @@ async def help_cmd(ctx: commands.Context, command_name: Optional[str] = None):
         emb.add_field(name=usage, value=c.help or "No description", inline=False)
     await ctx.reply(embed=emb)
 
-# Reload roles, owner only
 @bot.command(name="reloadroles", help="Reload roles.json from disk. Owner only.")
 async def reloadroles(ctx: commands.Context):
     if ctx.guild is None or ctx.author != ctx.guild.owner:
@@ -1253,8 +1305,6 @@ async def reloadroles(ctx: commands.Context):
         await ctx.reply("Loaded, allowed_role_ids is empty. Only the owner can use restricted commands.")
     else:
         await ctx.reply(f"Loaded {len(ALLOWED_ROLE_IDS)} allowed role id(s).")
-
-# ---------- Errors ----------
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
@@ -1274,8 +1324,7 @@ async def on_command_error(ctx: commands.Context, error):
 # ---------- Start ----------
 
 async def main():
-    # If you use Render Web Service, keep the health server line. For a Background Worker, remove start_web.
-    web_task = asyncio.create_task(start_web())
+    web_task = asyncio.create_task(start_web())  # remove this line if you run as a Background Worker on Render
     try:
         async with bot:
             await bot.start(TOKEN)
