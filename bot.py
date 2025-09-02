@@ -279,6 +279,13 @@ def load_allowed_roles() -> Set[int]:
 
 ALLOWED_ROLE_IDS: Set[int] = load_allowed_roles()
 
+def save_allowed_roles(role_ids: Set[int]) -> None:
+    """Write roles.json, sorted for tidy diffs."""
+    data = {"allowed_role_ids": sorted(int(r) for r in role_ids)}
+    with open(ROLES_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+
+
 def can_act_on(target: discord.Member, actor: discord.Member, me: discord.Member) -> Tuple[bool, str]:
     if target == actor:
         return False, "You cannot moderate yourself."
@@ -342,16 +349,28 @@ def _appeals_target_channel_id() -> int:
 
 @bot.check
 async def role_gate(ctx: commands.Context) -> bool:
+    # public commands always allowed
     if ctx.command and ctx.command.qualified_name in PUBLIC_COMMANDS:
         return True
+
+    # DMs, only the public DM set
     if ctx.guild is None:
         return bool(ctx.command and ctx.command.qualified_name in PUBLIC_DM_COMMANDS)
+
+    # server owner always allowed
     if ctx.author == ctx.guild.owner:
         return True
+
+    # any Administrator role, always allowed
+    if getattr(ctx.author.guild_permissions, "administrator", False):
+        return True
+
+    # fall back to allow list
     if not ALLOWED_ROLE_IDS:
         return False
     author_roles = {r.id for r in getattr(ctx.author, "roles", [])}
     return len(author_roles.intersection(ALLOWED_ROLE_IDS)) > 0
+
 
 # ---------- Events ----------
 
@@ -1305,6 +1324,56 @@ async def reloadroles(ctx: commands.Context):
         await ctx.reply("Loaded, allowed_role_ids is empty. Only the owner can use restricted commands.")
     else:
         await ctx.reply(f"Loaded {len(ALLOWED_ROLE_IDS)} allowed role id(s).")
+
+def _owner_or_admin(ctx: commands.Context) -> bool:
+    return ctx.guild is not None and (ctx.author == ctx.guild.owner or ctx.author.guild_permissions.administrator)
+
+@bot.command(name="addrole", usage="role_id", help="Add a role id to the allow list for restricted commands.")
+async def addrole(ctx: commands.Context, role_id: int):
+    if not _owner_or_admin(ctx):
+        await ctx.reply("Only the server owner or an admin can use this.")
+        return
+    role = ctx.guild.get_role(role_id)
+    if not role:
+        await ctx.reply("That role id is not in this server.")
+        return
+    global ALLOWED_ROLE_IDS
+    if role_id in ALLOWED_ROLE_IDS:
+        await ctx.reply(f"{role.name} is already in the allow list.")
+        return
+    ALLOWED_ROLE_IDS.add(role_id)
+    save_allowed_roles(ALLOWED_ROLE_IDS)
+    await ctx.reply(f"Added {role.name}  id {role_id} to the allow list.")
+
+@bot.command(name="removerole", usage="role_id", help="Remove a role id from the allow list.")
+async def removerole(ctx: commands.Context, role_id: int):
+    if not _owner_or_admin(ctx):
+        await ctx.reply("Only the server owner or an admin can use this.")
+        return
+    role = ctx.guild.get_role(role_id)
+    global ALLOWED_ROLE_IDS
+    if role_id not in ALLOWED_ROLE_IDS:
+        await ctx.reply("That role id is not in the allow list.")
+        return
+    ALLOWED_ROLE_IDS.remove(role_id)
+    save_allowed_roles(ALLOWED_ROLE_IDS)
+    name = role.name if role else "unknown role"
+    await ctx.reply(f"Removed {name}  id {role_id} from the allow list.")
+
+@bot.command(name="listroles", help="Show the current allow list from roles.json.")
+async def listroles(ctx: commands.Context):
+    if not _owner_or_admin(ctx):
+        await ctx.reply("Only the server owner or an admin can use this.")
+        return
+    if not ALLOWED_ROLE_IDS:
+        await ctx.reply("Allow list is empty. Admins and the owner can still use the bot.")
+        return
+    lines = []
+    for rid in sorted(ALLOWED_ROLE_IDS):
+        role = ctx.guild.get_role(rid)
+        lines.append(f"{rid}  {role.name if role else 'unknown role'}")
+    await ctx.reply("Allowed roles:\n" + "\n".join(lines))
+
 
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
