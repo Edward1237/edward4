@@ -227,6 +227,11 @@ INSTANCE = os.getenv("BOT_INSTANCE", "unknown")
 async def instance(ctx):
     await ctx.reply(f"Instance, {INSTANCE}")
 
+@bot.command(name="ping", help="Say hello.")
+async def ping(ctx: commands.Context):
+    await ctx.reply(f"Hello {ctx.author.mention}, how can I help?")
+
+
 
 
 # ---------- Config ----------
@@ -254,8 +259,8 @@ ROLES_FILE = "roles.json"
 ALLOWED_ROLE_IDS: Set[int] = set()
 
 # Which commands are public for everyone
-PUBLIC_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus"}
-PUBLIC_DM_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus"}
+PUBLIC_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus", "ping"}
+PUBLIC_DM_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus", "ping"}
 
 # top of file
 import os, asyncio
