@@ -36,6 +36,9 @@ STORAGE_WARN_CH_ID = int(os.getenv("STORAGE_WARN_CH_ID", "1412405374056796221"))
 STORAGE_TICKETS_CH_ID = int(os.getenv("STORAGE_TICKETS_CH_ID", "1412405423272628315"))
 STORAGE_OPTIN_CH_ID = int(os.getenv("STORAGE_OPTIN_CH_ID", "1412405448468070521"))
 STORAGE_BANS_CH_ID = int(os.getenv("STORAGE_BANS_CH_ID", "1412440601818960002"))
+STORAGE_CONFIG_CH_ID = int(os.getenv("STORAGE_CONFIG_CH_ID", "1412533557426913310"))
+
+_CONFIG_CACHE: dict = {}  # key, guild_id string, value, config dict
 
 # Instance labeling and single instance gate
 INSTANCE = os.getenv("BOT_INSTANCE", "unknown")
@@ -96,6 +99,7 @@ def _storage_targets() -> list[Tuple[str, int]]:
         ("tickets", STORAGE_TICKETS_CH_ID),
         ("dm_optin", STORAGE_OPTIN_CH_ID),
         ("bans", STORAGE_BANS_CH_ID),
+        ("config", STORAGE_CONFIG_CH_ID),  # new
     ]
 
 def _cache_for(name: str) -> dict:
@@ -104,7 +108,9 @@ def _cache_for(name: str) -> dict:
         "tickets": _TICKETS_CACHE,
         "dm_optin": _OPTIN_CACHE,
         "bans": _BANS_CACHE,
+        "config": _CONFIG_CACHE,  # new
     }[name]
+
 
 async def _get_text_channel(cid: int) -> Optional[discord.TextChannel]:
     ch = bot.get_channel(cid)
@@ -194,6 +200,8 @@ async def storage_bootstrap():
                 _OPTIN_CACHE = data
             elif name == "bans":
                 _BANS_CACHE = data
+            elif name == "config":  # new
+                _CONFIG_CACHE = data
         _storage_ready.set()
         print("[storage] ready")
     except Exception as e:
@@ -344,6 +352,34 @@ async def set_timeout(member: discord.Member, until_dt: Optional[datetime], reas
 
 def _appeals_target_channel_id() -> int:
     return APPEALS_CHANNEL_ID if APPEALS_CHANNEL_ID > 0 else MODLOG_CHANNEL_ID
+
+def load_config() -> dict:
+    return _CONFIG_CACHE or {}
+
+def save_config(data: dict) -> None:
+    _CONFIG_CACHE.clear()
+    _CONFIG_CACHE.update(data)
+    _schedule_save("config", STORAGE_CONFIG_CH_ID)
+
+def get_guild_cfg(guild_id: int) -> dict:
+    cfg = load_config().get(str(guild_id), {})
+    return {
+        "welcome_channel_id": int(cfg.get("welcome_channel_id") or 0),
+        "leave_channel_id": int(cfg.get("leave_channel_id") or 0),
+        "dm_enabled": bool(cfg.get("dm_enabled", True)),
+        "welcome_msg": str(cfg.get("welcome_msg", "Welcome {mention} to {guild}!")),
+        "leave_msg": str(cfg.get("leave_msg", "{user} left the server.")),
+        "dm_msg": str(cfg.get("dm_msg", "Hey {user}, welcome to {guild}. Please read the rules.")),
+    }
+
+def _format_member_text(text: str, member: discord.Member) -> str:
+    g = member.guild
+    t = _format_placeholders(text, g, member)
+    t = t.replace("{count}", str(g.member_count or 0))
+    t = t.replace("{id}", str(member.id))
+    return t
+
+
 
 # ---------- Global role gate ----------
 
@@ -1019,6 +1055,150 @@ async def discopost(ctx: commands.Context, channel_id: int, *, json_text: Option
     with contextlib.suppress(Exception):
         await channel.send(content=content or None, embeds=embeds or None, view=view, allowed_mentions=discord.AllowedMentions.none())
     await ctx.reply(f"Sent to <#{channel.id}>.")
+
+
+def _owner_or_admin(ctx: commands.Context) -> bool:
+    return ctx.guild is not None and (ctx.author == ctx.guild.owner or ctx.author.guild_permissions.administrator)
+
+@bot.group(name="configsetup", invoke_without_command=True, help="Configure welcome and leave settings. Use subcommands.")
+async def configsetup(ctx: commands.Context):
+    if ctx.guild is None:
+        await ctx.reply("Run this in a server.")
+        return
+    if not _owner_or_admin(ctx):
+        await ctx.reply("Only the server owner or an admin can use this.")
+        return
+    cfg = get_guild_cfg(ctx.guild.id)
+    emb = discord.Embed(title=f"Config for {ctx.guild.name}")
+    emb.add_field(name="welcome_channel_id", value=str(cfg["welcome_channel_id"]), inline=False)
+    emb.add_field(name="leave_channel_id", value=str(cfg["leave_channel_id"]), inline=False)
+    emb.add_field(name="dm_enabled", value=str(cfg["dm_enabled"]), inline=False)
+    emb.add_field(name="welcome_msg", value=cfg["welcome_msg"][:512], inline=False)
+    emb.add_field(name="leave_msg", value=cfg["leave_msg"][:512], inline=False)
+    emb.add_field(name="dm_msg", value=cfg["dm_msg"][:512], inline=False)
+    emb.set_footer(text="Subcommands, %configsetup welcome_channel <id>, leave_channel <id>, welcome_msg <text>, leave_msg <text>, dm_msg <text>, dm on|off")
+    await ctx.reply(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+
+@configsetup.command(name="welcome_channel", usage="channel_id", help="Set the welcome channel id.")
+async def configsetup_welcome_channel(ctx: commands.Context, channel_id: int):
+    if ctx.guild is None or not _owner_or_admin(ctx):
+        await ctx.reply("Only the server owner or an admin can use this.")
+        return
+    ch = ctx.guild.get_channel(channel_id)
+    if not isinstance(ch, discord.TextChannel):
+        await ctx.reply("That id is not a text channel in this server.")
+        return
+    data = load_config()
+    g = data.setdefault(str(ctx.guild.id), {})
+    g["welcome_channel_id"] = channel_id
+    save_config(data)
+    await ctx.reply(f"Set welcome_channel_id to <#{channel_id}>.")
+
+@configsetup.command(name="leave_channel", usage="channel_id", help="Set the leave channel id.")
+async def configsetup_leave_channel(ctx: commands.Context, channel_id: int):
+    if ctx.guild is None or not _owner_or_admin(ctx):
+        await ctx.reply("Only the server owner or an admin can use this.")
+        return
+    ch = ctx.guild.get_channel(channel_id)
+    if not isinstance(ch, discord.TextChannel):
+        await ctx.reply("That id is not a text channel in this server.")
+        return
+    data = load_config()
+    g = data.setdefault(str(ctx.guild.id), {})
+    g["leave_channel_id"] = channel_id
+    save_config(data)
+    await ctx.reply(f"Set leave_channel_id to <#{channel_id}>.")
+
+@configsetup.command(name="welcome_msg", usage="text", help="Set the welcome message. Supports {user} {mention} {guild} {count} {id}.")
+async def configsetup_welcome_msg(ctx: commands.Context, *, text: str):
+    if ctx.guild is None or not _owner_or_admin(ctx):
+        await ctx.reply("Only the server owner or an admin can use this.")
+        return
+    data = load_config()
+    g = data.setdefault(str(ctx.guild.id), {})
+    g["welcome_msg"] = text
+    save_config(data)
+    await ctx.reply("Updated welcome_msg.")
+
+@configsetup.command(name="leave_msg", usage="text", help="Set the leave message. Supports {user} {mention} {guild} {count} {id}.")
+async def configsetup_leave_msg(ctx: commands.Context, *, text: str):
+    if ctx.guild is None or not _owner_or_admin(ctx):
+        await ctx.reply("Only the server owner or an admin can use this.")
+        return
+    data = load_config()
+    g = data.setdefault(str(ctx.guild.id), {})
+    g["leave_msg"] = text
+    save_config(data)
+    await ctx.reply("Updated leave_msg.")
+
+@configsetup.command(name="dm_msg", usage="text", help="Set the DM welcome message. Supports {user} {mention} {guild} {count} {id}.")
+async def configsetup_dm_msg(ctx: commands.Context, *, text: str):
+    if ctx.guild is None or not _owner_or_admin(ctx):
+        await ctx.reply("Only the server owner or an admin can use this.")
+        return
+    data = load_config()
+    g = data.setdefault(str(ctx.guild.id), {})
+    g["dm_msg"] = text
+    save_config(data)
+    await ctx.reply("Updated dm_msg.")
+
+@configsetup.command(name="dm", usage="on|off", help="Enable or disable DM welcomes.")
+async def configsetup_dm(ctx: commands.Context, toggle: str):
+    if ctx.guild is None or not _owner_or_admin(ctx):
+        await ctx.reply("Only the server owner or an admin can use this.")
+        return
+    val = toggle.strip().lower()
+    if val not in {"on", "off"}:
+        await ctx.reply("Use on or off.")
+        return
+    data = load_config()
+    g = data.setdefault(str(ctx.guild.id), {})
+    g["dm_enabled"] = (val == "on")
+    save_config(data)
+    await ctx.reply(f"DM welcomes set to {val}.")
+
+@bot.command(name="configshow", help="Show current welcome and leave config for this server.")
+async def configshow(ctx: commands.Context):
+    if ctx.guild is None:
+        await ctx.reply("Run this in a server.")
+        return
+    cfg = get_guild_cfg(ctx.guild.id)
+    emb = discord.Embed(title=f"Config for {ctx.guild.name}")
+    emb.add_field(name="welcome_channel_id", value=str(cfg["welcome_channel_id"]), inline=False)
+    emb.add_field(name="leave_channel_id", value=str(cfg["leave_channel_id"]), inline=False)
+    emb.add_field(name="dm_enabled", value=str(cfg["dm_enabled"]), inline=False)
+    emb.add_field(name="welcome_msg", value=cfg["welcome_msg"][:512], inline=False)
+    emb.add_field(name="leave_msg", value=cfg["leave_msg"][:512], inline=False)
+    emb.add_field(name="dm_msg", value=cfg["dm_msg"][:512], inline=False)
+    await ctx.reply(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+
+@bot.command(name="configtest", usage="join|leave|dm", help="Preview your welcome or leave messages.")
+async def configtest(ctx: commands.Context, which: str):
+    if ctx.guild is None:
+        await ctx.reply("Run this in a server.")
+        return
+    which = which.lower().strip()
+    if which not in {"join", "leave", "dm"}:
+        await ctx.reply("Use join, leave, or dm.")
+        return
+    cfg = get_guild_cfg(ctx.guild.id)
+    member = ctx.author if isinstance(ctx.author, discord.Member) else ctx.guild.get_member(ctx.author.id)
+    if not isinstance(member, discord.Member):
+        await ctx.reply("Could not resolve you as a member here.")
+        return
+    if which == "dm":
+        text = _format_member_text(cfg["dm_msg"], member)
+        emb = discord.Embed(title=f"DM welcome preview for {ctx.guild.name}", description=text, color=discord.Color.blurple())
+        await ctx.reply(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+        return
+    if which == "join":
+        text = _format_member_text(cfg["welcome_msg"], member)
+        emb = discord.Embed(title="Member joined, preview", description=text, color=discord.Color.green())
+    else:
+        text = _format_member_text(cfg["leave_msg"], member)
+        emb = discord.Embed(title="Member left, preview", description=text, color=discord.Color.red())
+    emb.add_field(name="User", value=f"{member.mention}  id {member.id}", inline=False)
+    await ctx.reply(embed=emb, allowed_mentions=discord.AllowedMentions(users=True, roles=False, everyone=False))
 
 # ---------- Ticket system ----------
 
