@@ -66,19 +66,20 @@ async def _ensure_index_message(channel: discord.TextChannel, tag: str) -> disco
     """
     Keep one pinned index message per storage channel, content is a small tag.
     """
+    # look through pinned messages using the async iterator
     try:
-        pins = await channel.pins()
+        async for m in channel.pins():
+            if m.author.id == bot.user.id and tag in (m.content or ""):
+                return m
     except discord.Forbidden:
-        pins = []
-    for m in pins:
-        if m.author.id == bot.user.id and tag in (m.content or ""):
-            return m
+        pass  # cannot read pins, we will just create a new one
+
+    # none found, create and pin a new index message
     msg = await channel.send(f"[storage] {tag}")
-    try:
+    with contextlib.suppress(Exception):
         await msg.pin()
-    except Exception:
-        pass
     return msg
+
 
 async def _find_latest_attachment(channel: discord.TextChannel, filename: str) -> Optional[discord.Attachment]:
     """
