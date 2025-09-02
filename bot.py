@@ -25,11 +25,10 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+
+
 # ---------- Discord storage in a different server ----------
-import os
-import io
-import json
-import asyncio
+
 from typing import Optional, Tuple
 
 STORAGE_GUILD_ID = int(os.getenv("STORAGE_GUILD_ID", "0"))
@@ -209,6 +208,24 @@ def _save_optins(data: dict) -> None:
     _OPTIN_CACHE.update(data)
     _schedule_save("dm_optin", STORAGE_OPTIN_CH_ID)
 
+# imports ...
+
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN", "")
+PREFIX = "%"
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+
+# label this running copy
+INSTANCE = os.getenv("BOT_INSTANCE", "unknown")
+
+@bot.command()
+async def instance(ctx):
+    await ctx.reply(f"Instance, {INSTANCE}")
 
 
 
