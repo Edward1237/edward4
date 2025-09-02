@@ -1,47 +1,91 @@
 # bot.py
-# Moderation bot with % prefix, role gate, custom help, Discohook posting, and a Ticket system with DM support.
+# Moderation bot with percent prefix, role gate, discohook posting, ticket system, bulk DMs, DM appeal flow, and Discord based JSON storage
 
-
-import os
-import json
-import re
-import asyncio
-# at top with other imports
-import io
-import os
-import asyncio
-from aiohttp import web
-import contextlib
-
-
+import os, io, re, json, asyncio, contextlib, time
 from datetime import timedelta, datetime, timezone
-from typing import Optional, Tuple, Set, Dict
-
-DM_OPTIN_FILE = "dm_optin.json"
-DM_THROTTLE_SECONDS = 1.2   # delay between DMs
-
+from typing import Optional, Tuple, Set, Dict, Iterable
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
+from aiohttp import web
 
+# ---------- Config and startup basics ----------
 
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN", "")
 
-# ---------- Discord storage in a different server ----------
+PREFIX = "%"
+MODLOG_CHANNEL_ID = int(os.getenv("MODLOG_CHANNEL_ID", "0"))
 
-from typing import Optional, Tuple
+# Appeals, optional invite to a separate server
+APPEALS_CHANNEL_ID = int(os.getenv("APPEALS_CHANNEL_ID", "0"))
+APPEALS_JOIN_INVITE = os.getenv("APPEALS_JOIN_INVITE", "")
 
+# Ticket env
+TICKETS_GUILD_ID = int(os.getenv("TICKETS_GUILD_ID", "0"))
+TICKETS_CATEGORY_ID = int(os.getenv("TICKETS_CATEGORY_ID", "0"))
+TICKETS_PING_ROLE_ID = int(os.getenv("TICKETS_PING_ROLE_ID", "0"))
+TICKETS_DELETE_AFTER_SEC = int(os.getenv("TICKETS_DELETE_AFTER_SEC", "5"))
+
+# Storage guild and channel ids, these are for the Discord storage backend
 STORAGE_GUILD_ID = int(os.getenv("STORAGE_GUILD_ID", "0"))
 STORAGE_WARN_CH_ID = int(os.getenv("STORAGE_WARN_CH_ID", "0"))
 STORAGE_TICKETS_CH_ID = int(os.getenv("STORAGE_TICKETS_CH_ID", "0"))
 STORAGE_OPTIN_CH_ID = int(os.getenv("STORAGE_OPTIN_CH_ID", "0"))
 STORAGE_BANS_CH_ID = int(os.getenv("STORAGE_BANS_CH_ID", "0"))
 
-# in memory caches
+# Instance labeling and gate
+INSTANCE = os.getenv("BOT_INSTANCE", "unknown")
+ALLOWED_INSTANCE = os.getenv("ALLOWED_INSTANCE", "")  # set to render on the service you keep
+
+# Throttle for bulk DMs
+DM_THROTTLE_SECONDS = 1.2
+
+# Role file for the role gate
+ROLES_FILE = "roles.json"
+
+# Public commands allowed for everyone, both in guild and in DM
+PUBLIC_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus", "ping", "appeal"}
+PUBLIC_DM_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus", "ping", "appeal"}
+
+# Discord intents and bot
+intents = discord.Intents.default()
+intents.message_content = True
+intents.members = True
+bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
+
+# Only the allowed instance handles commands, if ALLOWED_INSTANCE is unset everyone is allowed
+@bot.check_once
+async def single_instance_gate(_ctx):
+    return not ALLOWED_INSTANCE or INSTANCE == ALLOWED_INSTANCE
+
+# Handy ping
+@bot.command()
+async def instance(ctx):
+    await ctx.reply(f"Instance, {INSTANCE}")
+
+# Tiny HTTP server for Render Web Service health checks
+async def health(_):
+    return web.json_response({"ok": True})
+
+async def start_web():
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", "8080"))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    print(f"[web] listening on {port}")
+
+# ---------- Discord storage in a different server ----------
+
 _WARN_CACHE: dict = {}
 _TICKETS_CACHE: dict = {}
 _OPTIN_CACHE: dict = {}
-_BANS_CACHE: dict = {}  # key, user_id string, value, list of ban events, newest last
+_BANS_CACHE: dict = {}
 _storage_ready = asyncio.Event()
 
 def _storage_targets() -> list[Tuple[str, int]]:
@@ -53,40 +97,34 @@ def _storage_targets() -> list[Tuple[str, int]]:
     ]
 
 def _cache_for(name: str) -> dict:
-    return {"warnings": _WARN_CACHE, "tickets": _TICKETS_CACHE, "dm_optin": _OPTIN_CACHE}[name]
+    mapping = {
+        "warnings": _WARN_CACHE,
+        "tickets": _TICKETS_CACHE,
+        "dm_optin": _OPTIN_CACHE,
+        "bans": _BANS_CACHE,
+    }
+    return mapping.get(name, {})
 
 async def _get_text_channel(cid: int) -> Optional[discord.TextChannel]:
     ch = bot.get_channel(cid)
     if ch is None:
-        try:
+        with contextlib.suppress(Exception):
             ch = await bot.fetch_channel(cid)
-        except Exception:
-            ch = None
     return ch if isinstance(ch, discord.TextChannel) else None
 
 async def _ensure_index_message(channel: discord.TextChannel, tag: str) -> discord.Message:
-    """
-    Keep one pinned index message per storage channel, content is a small tag.
-    """
-    # look through pinned messages using the async iterator
     try:
         async for m in channel.pins():
             if m.author.id == bot.user.id and tag in (m.content or ""):
                 return m
     except discord.Forbidden:
-        pass  # cannot read pins, we will just create a new one
-
-    # none found, create and pin a new index message
+        pass
     msg = await channel.send(f"[storage] {tag}")
     with contextlib.suppress(Exception):
         await msg.pin()
     return msg
 
-
 async def _find_latest_attachment(channel: discord.TextChannel, filename: str) -> Optional[discord.Attachment]:
-    """
-    Scan recent history for the newest attachment with this filename.
-    """
     async for m in channel.history(limit=100, oldest_first=False):
         if m.author.id != bot.user.id:
             continue
@@ -96,9 +134,6 @@ async def _find_latest_attachment(channel: discord.TextChannel, filename: str) -
     return None
 
 async def _load_one(name: str, cid: int) -> dict:
-    """
-    Load JSON from the storage channel by reading the latest attachment.
-    """
     ch = await _get_text_channel(cid)
     if not ch:
         print(f"[storage] channel {cid} not found for {name}, using empty")
@@ -117,28 +152,15 @@ async def _load_one(name: str, cid: int) -> dict:
         return {}
 
 async def _save_one(name: str, cid: int, data: dict) -> None:
-    """
-    Save JSON as a fresh attachment named {name}.json, keep a short index message pinned.
-    Also prune older bot messages with the same filename, keep the latest 3.
-    """
     ch = await _get_text_channel(cid)
     if not ch:
         print(f"[storage] cannot save, channel {cid} missing for {name}")
         return
-
-    # ensure index exists
     await _ensure_index_message(ch, f"{name}.json")
-
-    # upload new attachment
     payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
     file = discord.File(io.BytesIO(payload), filename=f"{name}.json")
-    try:
+    with contextlib.suppress(Exception):
         await ch.send(file=file, content=f"[storage] update {name}.json")
-    except Exception as e:
-        print(f"[storage] failed to upload {name}, {e}")
-        return
-
-    # prune older files to keep the channel tidy
     kept = 0
     to_delete: list[discord.Message] = []
     async for m in ch.history(limit=200, oldest_first=False):
@@ -155,16 +177,11 @@ async def _save_one(name: str, cid: int, data: dict) -> None:
             await m.delete()
 
 async def storage_bootstrap():
-    """
-    Load all datasets once after login.
-    """
     try:
         if not STORAGE_GUILD_ID:
             print("[storage] not configured, set STORAGE_* env vars")
             _storage_ready.set()
             return
-
-        # warm up caches
         global _WARN_CACHE, _TICKETS_CACHE, _OPTIN_CACHE, _BANS_CACHE
         for name, cid in _storage_targets():
             data = await _load_one(name, cid) if cid else {}
@@ -176,7 +193,6 @@ async def storage_bootstrap():
                 _OPTIN_CACHE = data
             elif name == "bans":
                 _BANS_CACHE = data
-
         _storage_ready.set()
         print("[storage] ready")
     except Exception as e:
@@ -188,7 +204,6 @@ def _schedule_save(name: str, cid: int):
     if cid:
         asyncio.create_task(_save_one(name, cid, data))
 
-# public helpers, same names you already use
 def load_warnings() -> dict:
     return _WARN_CACHE or {}
 
@@ -221,91 +236,8 @@ def save_bans(data: dict) -> None:
     _BANS_CACHE.update(data)
     _schedule_save("bans", STORAGE_BANS_CH_ID)
 
-
-# imports ...
-
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN", "")
-PREFIX = "%"
-
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-
-bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
-
-# label this process
-INSTANCE = os.getenv("BOT_INSTANCE", "unknown")
-# only this label is allowed to handle commands, set this env var on the service you keep
-ALLOWED_INSTANCE = os.getenv("ALLOWED_INSTANCE", "")
-
-@bot.check_once
-async def single_instance_gate(_ctx):
-    # if ALLOWED_INSTANCE is set, only that instance may handle commands
-    return not ALLOWED_INSTANCE or INSTANCE == ALLOWED_INSTANCE
-
-@bot.command()
-async def instance(ctx):
-    await ctx.reply(f"Instance, {INSTANCE}")
-
-
-
-
-
-
-# ---------- Config ----------
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN", "")
-MODLOG_CHANNEL_ID = int(os.getenv("MODLOG_CHANNEL_ID", "1378831049907245121"))
-
-PREFIX = "%"
-
-APPEALS_CHANNEL_ID = int(os.getenv("APPEALS_CHANNEL_ID", "1378831049907245121"))  # falls back to MODLOG_CHANNEL_ID if 0
-APPEALS_JOIN_INVITE = os.getenv("APPEALS_JOIN_INVITE", "") 
-
-
-# Ticket env
-TICKETS_GUILD_ID = int(os.getenv("TICKETS_GUILD_ID", "0"))
-TICKETS_CATEGORY_ID = int(os.getenv("TICKETS_CATEGORY_ID", "0"))
-TICKETS_PING_ROLE_ID = int(os.getenv("TICKETS_PING_ROLE_ID", "0"))
-TICKETS_DELETE_AFTER_SEC = int(os.getenv("TICKETS_DELETE_AFTER_SEC", "5"))
-
-intents = discord.Intents.default()
-intents.message_content = True
-intents.members = True
-
-bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
-
-
-ROLES_FILE = "roles.json"
-
-ALLOWED_ROLE_IDS: Set[int] = set()
-
-# Which commands are public for everyone
-PUBLIC_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus", "ping","appeal"}
-PUBLIC_DM_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus", "ping","appeal"}
-
-# top of file
-import os, asyncio
-from aiohttp import web
-
-async def health(_):
-    return web.json_response({"ok": True})
-
-async def start_web():
-    app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    port = int(os.getenv("PORT", "8080"))  # Render sets PORT
-    site = web.TCPSite(runner, "0.0.0.0", port)  # must be 0.0.0.0, not 127.0.0.1
-    await site.start()
-    print(f"[web] listening on {port}")
-
-
-
 # ---------- Helpers ----------
+
 def now_utc() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -321,7 +253,7 @@ def load_allowed_roles() -> Set[int]:
         print(f"Failed to read roles.json, {e}")
         return set()
 
-ALLOWED_ROLE_IDS = load_allowed_roles()
+ALLOWED_ROLE_IDS: Set[int] = load_allowed_roles()
 
 def can_act_on(target: discord.Member, actor: discord.Member, me: discord.Member) -> Tuple[bool, str]:
     if target == actor:
@@ -348,8 +280,6 @@ def parse_duration(s: str) -> Optional[timedelta]:
     if d == 0 and h == 0 and mins == 0:
         return None
     return timedelta(days=d, hours=h, minutes=mins)
-
-
 
 async def send_modlog(ctx: commands.Context, action: str, target: discord.abc.User, reason: str, extra: str = ""):
     if MODLOG_CHANNEL_ID <= 0:
@@ -381,10 +311,32 @@ async def set_timeout(member: discord.Member, until_dt: Optional[datetime], reas
     except TypeError:
         await member.edit(timeout=until_dt, reason=reason)
 
-
-
 def _appeals_target_channel_id() -> int:
     return APPEALS_CHANNEL_ID if APPEALS_CHANNEL_ID > 0 else MODLOG_CHANNEL_ID
+
+# ---------- Global role gate ----------
+
+@bot.check
+async def role_gate(ctx: commands.Context) -> bool:
+    if ctx.command and ctx.command.qualified_name in PUBLIC_COMMANDS:
+        return True
+    if ctx.guild is None:
+        return bool(ctx.command and ctx.command.qualified_name in PUBLIC_DM_COMMANDS)
+    if ctx.author == ctx.guild.owner:
+        return True
+    if not ALLOWED_ROLE_IDS:
+        return False
+    author_roles = {r.id for r in getattr(ctx.author, "roles", [])}
+    return len(author_roles.intersection(ALLOWED_ROLE_IDS)) > 0
+
+# ---------- Events ----------
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}, prefix {PREFIX}, instance {INSTANCE}")
+    asyncio.create_task(storage_bootstrap())
+
+# ---------- Appeal, DM interview with pretty embeds ----------
 
 _APPEAL_BUSY: set[int] = set()
 
@@ -394,31 +346,21 @@ async def _send_dm_embed(ch: discord.DMChannel, title: str, desc: str) -> discor
     return await ch.send(embed=emb)
 
 async def _dm_interview_pretty(user: discord.User) -> tuple[bool, dict, list[str]]:
-    """
-    Ask questions in DM with embeds, gather text and optional links, return ok, answers, attachment urls.
-    Bot deletes its prompts for privacy. Bots cannot delete the user's replies.
-    """
     try:
         dm = await user.create_dm()
     except Exception:
         return False, {}, []
-
-    q = [
+    questions = [
         ("Server name, optional", False, False),
         ("What action are you appealing, ban or mute or warn", True, False),
         ("What happened", True, False),
         ("Why should we reconsider", True, False),
         ("Links to evidence, optional, you can also attach files", False, True),
     ]
-
     answers: dict = {}
     attach_urls: list[str] = []
 
-    intro = await _send_dm_embed(
-        dm,
-        "Appeal start",
-        "I will ask a few questions. Reply within 4 minutes for each question."
-    )
+    intro = await _send_dm_embed(dm, "Appeal start", "I will ask a few questions. Reply within 4 minutes for each step.")
     with contextlib.suppress(Exception):
         await asyncio.sleep(1)
         await intro.delete()
@@ -426,45 +368,59 @@ async def _dm_interview_pretty(user: discord.User) -> tuple[bool, dict, list[str
     def check(m: discord.Message) -> bool:
         return m.author.id == user.id and m.channel.id == dm.id
 
-    for idx, (prompt, required, allow_files) in enumerate(q, start=1):
-        prompt_msg = await _send_dm_embed(dm, f"Step {idx}", prompt + ("\nRequired" if required else "\nOptional"))
+    for idx, (prompt, required, allow_files) in enumerate(questions, start=1):
+        pmsg = await _send_dm_embed(dm, f"Step {idx}", prompt + ("\nRequired" if required else "\nOptional"))
         try:
             msg = await bot.wait_for("message", check=check, timeout=240)
         except asyncio.TimeoutError:
             with contextlib.suppress(Exception):
-                await prompt_msg.delete()
+                await pmsg.delete()
             await dm.send("Timed out, appeal cancelled.")
             return False, {}, []
-
         content = msg.content.strip()
-
         if content.lower() == "cancel":
             with contextlib.suppress(Exception):
-                await prompt_msg.delete()
+                await pmsg.delete()
             await dm.send("Appeal cancelled.")
             return False, {}, []
-
         if not content and required and not msg.attachments:
             with contextlib.suppress(Exception):
-                await prompt_msg.delete()
+                await pmsg.delete()
             await dm.send("That step is required, appeal cancelled.")
             return False, {}, []
-
         if allow_files and msg.attachments:
             for a in msg.attachments:
                 with contextlib.suppress(Exception):
                     attach_urls.append(a.url)
-
         answers[prompt] = content
         with contextlib.suppress(Exception):
-            await prompt_msg.delete()
+            await pmsg.delete()
 
-    try:
-        await dm.send("Thanks, your appeal was recorded. You can delete your replies in this DM if you want extra privacy.")
-    except Exception:
-        pass
-
+    with contextlib.suppress(Exception):
+        await dm.send("Thanks, your appeal was recorded. You can delete your replies here for privacy.")
     return True, answers, attach_urls
+
+async def lookup_known_ban(user_id: int) -> Optional[dict]:
+    data = load_bans()
+    recs = data.get(str(user_id), [])
+    for rec in reversed(recs):
+        if not rec.get("unbanned", False):
+            return rec
+    # fallback, try visible guilds
+    with contextlib.suppress(Exception):
+        user_obj = await bot.fetch_user(user_id)
+    user_obj = user_obj if 'user_obj' in locals() else discord.Object(id=user_id)  # type: ignore
+    for g in bot.guilds:
+        with contextlib.suppress(Exception):
+            ban_entry = await g.fetch_ban(user_obj)
+            return {
+                "guild_id": g.id,
+                "guild_name": g.name,
+                "reason": ban_entry.reason or "No reason recorded",
+                "when": now_utc().isoformat(),
+                "unbanned": False,
+            }
+    return None
 
 @bot.command(name="appeal", help="Start an appeal interview in DMs, then send it to the staff channel.")
 async def appeal(ctx: commands.Context):
@@ -472,34 +428,27 @@ async def appeal(ctx: commands.Context):
     if ch_id <= 0:
         await ctx.reply("Appeals channel is not configured. Ask staff to set APPEALS_CHANNEL_ID or MODLOG_CHANNEL_ID.")
         return
-
     author = ctx.author
-    # always move to DM
     if ctx.guild is not None:
         try:
             await author.send("Hi, I will collect your appeal here in DM.")
         except discord.Forbidden:
-            await ctx.reply("I cannot DM you. Please enable DMs from server members, then try again."
-                            + (f" You can also join our appeals server, {APPEALS_JOIN_INVITE}" if APPEALS_JOIN_INVITE else ""))
+            extra = f" You can also join our appeals server, {APPEALS_JOIN_INVITE}" if APPEALS_JOIN_INVITE else ""
+            await ctx.reply("I cannot DM you. Enable DMs from server members, then try again." + extra)
             return
-
     if author.id in _APPEAL_BUSY:
         if ctx.guild is None:
-            await ctx.reply("You already have an active appeal, finish that one first.")
+            await ctx.reply("You already have an active appeal. Finish that one first.")
         else:
-            await author.send("You already have an active appeal, finish that one first.")
+            await author.send("You already have an active appeal. Finish that one first.")
         return
     _APPEAL_BUSY.add(author.id)
-
     try:
         ok, answers, attach_urls = await _dm_interview_pretty(author)
         if not ok:
             return
-
-        # look up any known ban for context
         ban = await lookup_known_ban(author.id)
 
-        # build staff embed
         emb = discord.Embed(
             title="New appeal",
             description="A user submitted an appeal",
@@ -513,19 +462,15 @@ async def appeal(ctx: commands.Context):
         emb.add_field(name="Action", value=answers.get("What action are you appealing, ban or mute or warn", "n, a")[:256], inline=False)
         emb.add_field(name="What happened", value=(answers.get("What happened") or "")[:1024], inline=False)
         emb.add_field(name="Why reconsider", value=(answers.get("Why should we reconsider") or "")[:1024], inline=False)
-
         if attach_urls:
             ev = "\n".join(attach_urls)
             emb.add_field(name="Evidence links", value=ev[:1024], inline=False)
-
         if ban:
             ban_text = f"Guild, {ban.get('guild_name','unknown')}  id {ban.get('guild_id','n, a')}\nReason, {ban.get('reason','No reason recorded')}"
             emb.add_field(name="Known ban, auto lookup", value=ban_text[:1024], inline=False)
-
         case_id = f"APL-{now_utc().strftime('%Y%m%d-%H%M')}-{str(author.id)[-4:]}"
         emb.set_footer(text=f"Appeal id {case_id}")
 
-        # post to appeals or modlog
         delivered = False
         try:
             ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
@@ -534,235 +479,23 @@ async def appeal(ctx: commands.Context):
                 delivered = True
         except Exception as e:
             print("[appeal] post failed,", repr(e))
-
         with contextlib.suppress(Exception):
             if delivered:
                 await author.send(f"Thanks, your appeal was sent to the moderators. Case id, {case_id}.")
             else:
                 extra = f" You can also join our appeals server, {APPEALS_JOIN_INVITE}" if APPEALS_JOIN_INVITE else ""
                 await author.send("Thanks, your appeal was recorded, but I could not post it to the staff channel." + extra)
-
         if ctx.guild is not None:
             with contextlib.suppress(Exception):
                 await ctx.reply("I DMd you the appeal questions, check your DMs.")
-
     finally:
         _APPEAL_BUSY.discard(author.id)
 
-
-async def lookup_known_ban(user_id: int) -> Optional[dict]:
-    """
-    Returns a dict with guild_id, guild_name, reason, when, unbanned, or None.
-    Looks in storage first, then tries guild.fetch_ban where possible.
-    """
-    data = load_bans()
-    recs = data.get(str(user_id), [])
-    for rec in reversed(recs):
-        if not rec.get("unbanned", False):
-            return rec
-
-    # fallback, light scan of guilds where the bot can see bans
-    try:
-        user_obj = await bot.fetch_user(user_id)
-    except Exception:
-        user_obj = discord.Object(id=user_id)  # type: ignore
-
-    for g in bot.guilds:
-        with contextlib.suppress(Exception):
-            ban_entry = await g.fetch_ban(user_obj)  # needs Ban Members permission
-            return {
-                "guild_id": g.id,
-                "guild_name": g.name,
-                "reason": ban_entry.reason or "No reason recorded",
-                "when": now_utc().isoformat(),
-                "unbanned": False,
-            }
-    return None
-
-
-
-
-
-# ---------- Bulk DM helpers ----------
-from typing import Iterable
-
-def _load_optins() -> dict:
-    if not os.path.exists(DM_OPTIN_FILE):
-        return {}
-    try:
-        with open(DM_OPTIN_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-def _save_optins(data: dict) -> None:
-    with open(DM_OPTIN_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-
-def _get_guild_for(ctx: commands.Context) -> Optional[discord.Guild]:
-    if ctx.guild:
-        return ctx.guild
-    gid = int(os.getenv("TICKETS_GUILD_ID", "0"))
-    return bot.get_guild(gid) if gid else None
-
-def _format_placeholders(text: str, guild: discord.Guild, user: discord.abc.User) -> str:
-    return (
-        text.replace("{user}", f"{user.name}")
-            .replace("{mention}", f"{getattr(user, 'mention', user.name)}")
-            .replace("{guild}", f"{guild.name}")
-    )
-
-async def _prepare_attachments(msg: discord.Message) -> list[discord.File]:
-    files: list[discord.File] = []
-    for a in msg.attachments:
-        try:
-            b = await a.read()
-            files.append(discord.File(io.BytesIO(b), filename=a.filename))
-        except Exception:
-            continue
-    return files
-
-DM_JOBS: dict[int, dict] = {}  # guild_id -> {"cancel": bool}
-
-
-# ---------- Discohook JSON helpers ----------
-def _parse_hex_or_int(x):
-    if x is None:
-        return None
-    if isinstance(x, int):
-        return x
-    x = str(x).strip()
-    if x.startswith("#"):
-        return int(x[1:], 16)
-    return int(x, 16) if all(c in "0123456789abcdefABCDEF" for c in x) else int(x)
-
-def _parse_ts(ts: str) -> Optional[datetime]:
-    if not ts:
-        return None
-    try:
-        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
-    except Exception:
-        return None
-
-def _to_embed(ed: dict) -> discord.Embed:
-    e = discord.Embed()
-    if "title" in ed:
-        e.title = ed["title"]
-    if "description" in ed:
-        e.description = ed["description"]
-    if "url" in ed:
-        e.url = ed["url"]
-    col = _parse_hex_or_int(ed.get("color"))
-    if col is not None:
-        e.color = discord.Color(col)
-    ts = _parse_ts(ed.get("timestamp"))
-    if ts:
-        e.timestamp = ts
-    auth = ed.get("author") or {}
-    if auth.get("name"):
-        e.set_author(name=auth.get("name"), url=auth.get("url"), icon_url=auth.get("icon_url"))
-    foot = ed.get("footer") or {}
-    if foot.get("text"):
-        e.set_footer(text=foot.get("text"), icon_url=foot.get("icon_url"))
-    thumb = ed.get("thumbnail") or {}
-    if thumb.get("url"):
-        e.set_thumbnail(url=thumb["url"])
-    img = ed.get("image") or {}
-    if img.get("url"):
-        e.set_image(url=img["url"])
-    for f in ed.get("fields") or []:
-        e.add_field(name=f.get("name", "‎"), value=f.get("value", "‎"), inline=bool(f.get("inline", False)))
-    return e
-
-def _to_view(components: list) -> Optional[discord.ui.View]:
-    if not components:
-        return None
-    view = discord.ui.View()
-    for row in components:
-        for comp in row.get("components", []):
-            if comp.get("type") != 2:
-                continue
-            style = int(comp.get("style", 1))
-            label = comp.get("label")
-            disabled = bool(comp.get("disabled", False))
-            emoji = None
-            if comp.get("emoji"):
-                try:
-                    emoji = discord.PartialEmoji.from_str(
-                        comp["emoji"].get("id") and f"{comp['emoji'].get('name')}:{comp['emoji'].get('id')}"
-                        or comp["emoji"].get("name")
-                    )
-                except Exception:
-                    emoji = None
-            if style == 5 and comp.get("url"):
-                btn = discord.ui.Button(style=discord.ButtonStyle.link, label=label, url=comp["url"],
-                                        disabled=disabled, emoji=emoji)
-                view.add_item(btn)
-            else:
-                continue
-    return view if any(True for _ in view.children) else None
-
-def parse_discohook_payload(payload: dict) -> tuple[str, list[discord.Embed], Optional[discord.ui.View]]:
-    if isinstance(payload, list) and payload:
-        payload = payload[0]
-    if "messages" in payload and payload["messages"]:
-        payload = payload["messages"][0]
-    base = payload["data"] if "data" in payload and isinstance(payload["data"], dict) else payload
-    content = base.get("content") or ""
-    embeds = [_to_embed(ed) for ed in (base.get("embeds") or [])][:10]
-    view = _to_view(base.get("components") or [])
-    return content, embeds, view
-
-# ---------- Global role gate ----------
-@bot.check
-async def role_gate(ctx: commands.Context) -> bool:
-    # Allow public commands
-    if ctx.command and ctx.command.qualified_name in PUBLIC_COMMANDS:
-        return True
-    # DMs, only public DM commands
-    if ctx.guild is None:
-        return bool(ctx.command and ctx.command.qualified_name in PUBLIC_DM_COMMANDS)
-    # Always allow the guild owner
-    if ctx.author == ctx.guild.owner:
-        return True
-    # No roles file or empty list, only owner can use restricted commands
-    if not ALLOWED_ROLE_IDS:
-        return False
-    author_roles = {r.id for r in getattr(ctx.author, "roles", [])}
-    return len(author_roles.intersection(ALLOWED_ROLE_IDS)) > 0
-
-# ---------- Events ----------
-@bot.event
-async def setup_hook():
-    # nothing to register for the DM interview version
-    pass
-
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user}, prefix {PREFIX}")
-    asyncio.create_task(storage_bootstrap())
-
-
-
-
-
 # ---------- Moderation Commands ----------
-@bot.command()
-async def instance(ctx):
-    await ctx.reply(f"Instance, {INSTANCE}")
 
 @bot.command(name="ping", help="Say hello.")
 async def ping(ctx: commands.Context):
     await ctx.reply(f"Hello {ctx.author.mention}, how can I help?")
-
-
-
-
-
-
-
-
-
 
 @bot.command(usage="@user reason", help="Ban a user, then DM them the reason.")
 @commands.has_permissions(ban_members=True)
@@ -786,18 +519,16 @@ async def ban(ctx: commands.Context, member: discord.Member, *, reason: Optional
     note = "DM sent" if dm_ok else "DM could not be delivered"
     await ctx.reply(f"Banned {member} , {note}.")
     await send_modlog(ctx, "Ban", member, msg, extra=note)
-    # inside ban, after you send the modlog
     bans = load_bans()
     bans.setdefault(str(member.id), []).append({
-    "guild_id": ctx.guild.id,
-    "guild_name": ctx.guild.name,
-    "moderator_id": ctx.author.id,
-    "reason": msg,
-    "when": now_utc().isoformat(),
-    "unbanned": False,
-})
+        "guild_id": ctx.guild.id,
+        "guild_name": ctx.guild.name,
+        "moderator_id": ctx.author.id,
+        "reason": msg,
+        "when": now_utc().isoformat(),
+        "unbanned": False,
+    })
     save_bans(bans)
-
 
 @bot.command(usage="user_id reason", help="Unban a user by id, then DM if possible.")
 @commands.has_permissions(ban_members=True)
@@ -817,24 +548,20 @@ async def unban(ctx: commands.Context, user_id: int, *, reason: Optional[str] = 
         await ctx.reply("Something went wrong while trying to unban.")
         return
     dm_ok = False
-    try:
+    with contextlib.suppress(Exception):
         user = await bot.fetch_user(user_id)
         dm_ok = await try_dm_after_action(user, f"Unbanned from {ctx.guild.name}", text, ctx.author)
-    except Exception:
-        dm_ok = False
     note = "DM sent" if dm_ok else "DM could not be delivered"
     await ctx.reply(f"Unbanned user id {user_id} , {note}.")
     await send_modlog(ctx, "Unban", user_obj, text, extra=note)
-    # inside unban, after you send the modlog
     bans = load_bans()
     recs = bans.get(str(user_id), [])
     for rec in reversed(recs):
         if rec.get("guild_id") == ctx.guild.id and not rec.get("unbanned", False):
             rec["unbanned"] = True
-        rec["unbanned_at"] = now_utc().isoformat()
-        break
+            rec["unbanned_at"] = now_utc().isoformat()
+            break
     save_bans(bans)
-
 
 @bot.command(usage="@user reason", help="Kick a user, then DM them the reason.")
 @commands.has_permissions(kick_members=True)
@@ -986,15 +713,93 @@ async def announce(ctx: commands.Context, channel_id: int, *, message: str):
     if channel is None or not isinstance(channel, (discord.TextChannel, discord.Thread)):
         await ctx.reply("Channel not found in this server.")
         return
-    try:
+    with contextlib.suppress(Exception):
         await channel.send(message)
-    except discord.Forbidden:
-        await ctx.reply("I do not have permission to send messages in that channel.")
-        return
-    except discord.HTTPException:
-        await ctx.reply("Something went wrong while sending the announcement.")
-        return
     await ctx.reply(f"Announcement sent to <#{channel_id}>.")
+
+# ---------- Discohook JSON posting ----------
+
+def _parse_hex_or_int(x):
+    if x is None:
+        return None
+    if isinstance(x, int):
+        return x
+    x = str(x).strip()
+    if x.startswith("#"):
+        return int(x[1:], 16)
+    return int(x, 16) if all(c in "0123456789abcdefABCDEF" for c in x) else int(x)
+
+def _parse_ts(ts: str) -> Optional[datetime]:
+    if not ts:
+        return None
+    with contextlib.suppress(Exception):
+        return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    return None
+
+def _to_embed(ed: dict) -> discord.Embed:
+    e = discord.Embed()
+    if "title" in ed:
+        e.title = ed["title"]
+    if "description" in ed:
+        e.description = ed["description"]
+    if "url" in ed:
+        e.url = ed["url"]
+    col = _parse_hex_or_int(ed.get("color"))
+    if col is not None:
+        e.color = discord.Color(col)
+    ts = _parse_ts(ed.get("timestamp"))
+    if ts:
+        e.timestamp = ts
+    auth = ed.get("author") or {}
+    if auth.get("name"):
+        e.set_author(name=auth.get("name"), url=auth.get("url"), icon_url=auth.get("icon_url"))
+    foot = ed.get("footer") or {}
+    if foot.get("text"):
+        e.set_footer(text=foot.get("text"), icon_url=foot.get("icon_url"))
+    thumb = ed.get("thumbnail") or {}
+    if thumb.get("url"):
+        e.set_thumbnail(url=thumb["url"])
+    img = ed.get("image") or {}
+    if img.get("url"):
+        e.set_image(url=img["url"])
+    for f in ed.get("fields") or []:
+        e.add_field(name=f.get("name", "‎"), value=f.get("value", "‎"), inline=bool(f.get("inline", False)))
+    return e
+
+def _to_view(components: list) -> Optional[discord.ui.View]:
+    if not components:
+        return None
+    view = discord.ui.View()
+    for row in components:
+        for comp in row.get("components", []):
+            if comp.get("type") != 2:
+                continue
+            style = int(comp.get("style", 1))
+            label = comp.get("label")
+            disabled = bool(comp.get("disabled", False))
+            emoji = None
+            if comp.get("emoji"):
+                with contextlib.suppress(Exception):
+                    emoji = discord.PartialEmoji.from_str(
+                        comp["emoji"].get("id") and f"{comp['emoji'].get('name')}:{comp['emoji'].get('id')}"
+                        or comp["emoji"].get("name")
+                    )
+            if style == 5 and comp.get("url"):
+                btn = discord.ui.Button(style=discord.ButtonStyle.link, label=label, url=comp["url"],
+                                        disabled=disabled, emoji=emoji)
+                view.add_item(btn)
+    return view if any(True for _ in view.children) else None
+
+def parse_discohook_payload(payload: dict) -> tuple[str, list[discord.Embed], Optional[discord.ui.View]]:
+    if isinstance(payload, list) and payload:
+        payload = payload[0]
+    if "messages" in payload and payload["messages"]:
+        payload = payload["messages"][0]
+    base = payload["data"] if "data" in payload and isinstance(payload["data"], dict) else payload
+    content = base.get("content") or ""
+    embeds = [_to_embed(ed) for ed in (base.get("embeds") or [])][:10]
+    view = _to_view(base.get("components") or [])
+    return content, embeds, view
 
 @bot.command(
     name="discopost",
@@ -1011,12 +816,9 @@ async def discopost(ctx: commands.Context, channel_id: int, *, json_text: Option
     payload_text = None
     for att in ctx.message.attachments:
         if att.filename.lower().endswith(".json"):
-            try:
+            with contextlib.suppress(Exception):
                 payload_text = (await att.read()).decode("utf-8", errors="replace")
-            except Exception:
-                await ctx.reply("Could not read the attached file.")
-                return
-            break
+                break
     if payload_text is None:
         if not json_text:
             await ctx.reply("Provide a JSON attachment or paste JSON after the channel id.")
@@ -1028,34 +830,19 @@ async def discopost(ctx: commands.Context, channel_id: int, *, json_text: Option
         payload_text = t
     try:
         data = json.loads(payload_text)
-    except json.JSONDecodeError as e:
-        await ctx.reply(f"Invalid JSON, {e}")
-        return
-    try:
         content, embeds, view = parse_discohook_payload(data)
     except Exception as e:
-        await ctx.reply(f"Could not convert payload, {e}")
+        await ctx.reply(f"Invalid or unsupported JSON, {e}")
         return
-    try:
-        await channel.send(
-            content=content or None,
-            embeds=embeds or None,
-            view=view,
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-    except discord.Forbidden:
-        await ctx.reply("I do not have permission to send messages or embeds in that channel.")
-        return
-    except discord.HTTPException as e:
-        await ctx.reply(f"Discord rejected the message, {e}")
-        return
+    with contextlib.suppress(Exception):
+        await channel.send(content=content or None, embeds=embeds or None, view=view, allowed_mentions=discord.AllowedMentions.none())
     await ctx.reply(f"Sent to <#{channel.id}>.")
 
 # ---------- Ticket System ----------
+
 def ticket_name_for(user: discord.abc.User) -> str:
     suffix = str(user.id)[-4:]
-    base = re.sub(r"[^a-z0-9]+", "-", user.name.lower())
-    base = base.strip("-") or "user"
+    base = re.sub(r"[^a-z0-9]+", "-", user.name.lower()).strip("-") or "user"
     return f"ticket-{base}-{suffix}"
 
 def staff_overwrites(guild: discord.Guild, opener: discord.Member) -> Dict[discord.abc.Snowflake, discord.PermissionOverwrite]:
@@ -1074,27 +861,23 @@ async def collect_reason_via_dm(user: discord.User, prompt_from: Optional[discor
     try:
         dm = await user.create_dm()
         await dm.send("Please reply with your ticket reason within 2 minutes.")
+        channel: discord.abc.Messageable = dm
     except discord.Forbidden:
-        if prompt_from:
-            await prompt_from.send("I could not DM you, please type your ticket reason here within 2 minutes.")
-            channel = prompt_from
-        else:
+        if not prompt_from:
             return None
-    else:
-        channel = dm
+        await prompt_from.send("I could not DM you, please type your ticket reason here within 2 minutes.")
+        channel = prompt_from
 
     def check(m: discord.Message) -> bool:
-        return m.author.id == user.id and m.channel.id == channel.id
+        return m.author.id == user.id and m.channel.id == getattr(channel, "id", None)
 
     try:
         msg = await bot.wait_for("message", check=check, timeout=120)
         reason = msg.content.strip()
         return reason if reason else None
     except asyncio.TimeoutError:
-        try:
+        with contextlib.suppress(Exception):
             await channel.send("Timed out waiting for your reason.")
-        except Exception:
-            pass
         return None
 
 async def create_ticket(guild: discord.Guild, category_id: int, opener: discord.Member, reason: str) -> Optional[discord.TextChannel]:
@@ -1106,12 +889,9 @@ async def create_ticket(guild: discord.Guild, category_id: int, opener: discord.
     try:
         channel = await guild.create_text_channel(name=name, category=category, overwrites=overwrites,
                                                  reason=f"Ticket by {opener} , {reason[:200]}")
-    except discord.Forbidden:
-        return None
-    except discord.HTTPException:
+    except (discord.Forbidden, discord.HTTPException):
         return None
 
-    # Save registry
     reg = load_tickets()
     reg[str(channel.id)] = {
         "guild_id": guild.id,
@@ -1122,57 +902,44 @@ async def create_ticket(guild: discord.Guild, category_id: int, opener: discord.
     }
     save_tickets(reg)
 
-    # First message
     ping = f"<@&{TICKETS_PING_ROLE_ID}>" if TICKETS_PING_ROLE_ID > 0 else ""
     embed = discord.Embed(title="New ticket", description=reason or "No reason provided")
     embed.add_field(name="User", value=f"{opener.mention}  ({opener.id})", inline=False)
     embed.add_field(name="How to close", value=f"Use {PREFIX}close [optional reason] in this channel.", inline=False)
-    await channel.send(content=ping if ping else None,
-                       embed=embed,
+    await channel.send(content=ping if ping else None, embed=embed,
                        allowed_mentions=discord.AllowedMentions(roles=bool(ping), users=True))
     return channel
 
 @bot.command(name="ticket", usage="[reason]", help="Open a private ticket. Works in server or DM. If no reason is given, the bot will ask you.")
 async def ticket_cmd(ctx: commands.Context, *, reason: Optional[str] = None):
-    # Find the target guild
     guild = ctx.guild or (bot.get_guild(TICKETS_GUILD_ID) if TICKETS_GUILD_ID else None)
     if guild is None:
-        await ctx.reply("Ticket guild is not configured. Ask an admin to set TICKETS_GUILD_ID in the .env file.")
+        await ctx.reply("Ticket guild is not configured. Ask an admin to set TICKETS_GUILD_ID in the env file.")
         return
-    # Resolve opener as a member of the guild
     try:
         opener = ctx.author if isinstance(ctx.author, discord.Member) and ctx.author.guild.id == guild.id else await guild.fetch_member(ctx.author.id)
     except discord.NotFound:
         await ctx.reply("You are not a member of the ticket guild.")
         return
-
     if TICKETS_CATEGORY_ID <= 0:
-        await ctx.reply("Ticket category is not configured. Ask an admin to set TICKETS_CATEGORY_ID in the .env file.")
+        await ctx.reply("Ticket category is not configured. Ask an admin to set TICKETS_CATEGORY_ID in the env file.")
         return
-
-    # Collect reason if missing
     if not reason:
-        # If invoked in a server, move to DM for privacy
         reason = await collect_reason_via_dm(opener, prompt_from=None if ctx.guild is None else ctx.channel)
         if not reason:
             if ctx.guild:
                 await ctx.reply("No reason provided, ticket cancelled.")
             return
-
     channel = await create_ticket(guild, TICKETS_CATEGORY_ID, opener, reason)
     if not channel:
         await ctx.reply("Could not create the ticket channel, check my permissions and the category id.")
         return
-
-    # Reply with link in place where the command ran
     link = f"<#{channel.id}>"
     if ctx.guild:
         await ctx.reply(f"Your ticket has been created, {link}")
     else:
-        try:
+        with contextlib.suppress(Exception):
             await ctx.author.send(f"Your ticket has been created, {link}")
-        except Exception:
-            pass
 
 @bot.command(name="close", usage="[reason]", help="Close the current ticket channel. Staff and the opener can use this in a ticket.")
 async def close_cmd(ctx: commands.Context, *, reason: Optional[str] = None):
@@ -1183,7 +950,6 @@ async def close_cmd(ctx: commands.Context, *, reason: Optional[str] = None):
     if not info or info.get("closed"):
         await ctx.reply("This is not an active ticket channel.")
         return
-
     opener_id = info.get("opener_id")
     is_staff = any(r.id in ALLOWED_ROLE_IDS for r in getattr(ctx.author, "roles", []))
     is_opener = ctx.author.id == opener_id
@@ -1191,22 +957,15 @@ async def close_cmd(ctx: commands.Context, *, reason: Optional[str] = None):
     if not (is_staff or is_opener or is_owner):
         await ctx.reply("Only staff or the ticket opener can close this ticket.")
         return
-
-    # Mark closed
     info["closed"] = True
     info["closed_at"] = now_utc().isoformat()
     info["close_reason"] = reason or "No reason provided"
     reg[str(ctx.channel.id)] = info
     save_tickets(reg)
-
-    # Announce, then delete
     embed = discord.Embed(title="Ticket closed", description=info["close_reason"])
     embed.add_field(name="Closed by", value=str(ctx.author), inline=False)
-    try:
+    with contextlib.suppress(Exception):
         await ctx.reply(embed=embed, allowed_mentions=discord.AllowedMentions.none())
-    except Exception:
-        pass
-
     delay = max(0, TICKETS_DELETE_AFTER_SEC)
     try:
         await asyncio.sleep(delay)
@@ -1216,75 +975,40 @@ async def close_cmd(ctx: commands.Context, *, reason: Optional[str] = None):
     except discord.HTTPException:
         pass
 
-@bot.command(help="Opt in to receive server DMs from staff. Works in server or DM.")
-async def dmoptin(ctx: commands.Context):
-    guild = _get_guild_for(ctx)
-    if not guild:
-        await ctx.reply("No target server configured.")
-        return
-    data = _load_optins()
-    g = data.setdefault(str(guild.id), {"users": []})
-    if ctx.author.id in g["users"]:
-        await ctx.reply("You are already opted in.")
-        return
-    g["users"].append(ctx.author.id)
-    _save_optins(data)
-    await ctx.reply(f"Opt in saved for {guild.name}.")
+# ---------- Bulk DM helpers ----------
 
-@bot.command(help="Opt out of server DMs. Works in server or DM.")
-async def dmoptout(ctx: commands.Context):
-    guild = _get_guild_for(ctx)
-    if not guild:
-        await ctx.reply("No target server configured.")
-        return
-    data = _load_optins()
-    g = data.setdefault(str(guild.id), {"users": []})
-    if ctx.author.id in g["users"]:
-        g["users"].remove(ctx.author.id)
-        _save_optins(data)
-        await ctx.reply(f"Opt out saved for {guild.name}.")
-    else:
-        await ctx.reply("You are not opted in.")
+def _get_guild_for(ctx: commands.Context) -> Optional[discord.Guild]:
+    if ctx.guild:
+        return ctx.guild
+    gid = int(os.getenv("TICKETS_GUILD_ID", "0"))
+    return bot.get_guild(gid) if gid else None
 
-@bot.command(help="Show whether you are opted in to bulk DMs.")
-async def dmstatus(ctx: commands.Context):
-    guild = _get_guild_for(ctx)
-    if not guild:
-        await ctx.reply("No target server configured.")
-        return
-    data = _load_optins()
-    g = data.get(str(guild.id), {"users": []})
-    status = "opted in" if ctx.author.id in g.get("users", []) else "opted out"
-    await ctx.reply(f"You are {status} for {guild.name}.")
+def _format_placeholders(text: str, guild: discord.Guild, user: discord.abc.User) -> str:
+    return text.replace("{user}", f"{user.name}").replace("{mention}", f"{getattr(user, 'mention', user.name)}").replace("{guild}", f"{guild.name}")
 
-async def _bulk_dm_send(
-    ctx: commands.Context,
-    targets: Iterable[discord.Member],
-    message: str,
-    files: list[discord.File]
-):
+async def _prepare_attachments(msg: discord.Message) -> list[discord.File]:
+    files: list[discord.File] = []
+    for a in msg.attachments:
+        with contextlib.suppress(Exception):
+            b = await a.read()
+            files.append(discord.File(io.BytesIO(b), filename=a.filename))
+    return files
+
+DM_JOBS: dict[int, dict] = {}
+
+async def _bulk_dm_send(ctx: commands.Context, targets: Iterable[discord.Member], message: str, files: list[discord.File]):
     guild = ctx.guild or _get_guild_for(ctx)
     if not guild:
         await ctx.reply("No target server configured.")
         return
-
     job = DM_JOBS.setdefault(guild.id, {"cancel": False})
     job["cancel"] = False
-
-    sent = 0
-    failed = 0
-    skipped = 0
-
+    sent = failed = skipped = 0
     progress = await ctx.reply("Starting DM send, 0 sent, 0 failed, 0 skipped.")
-
-    # build a lightweight AllowedMentions that does not ping everyone or here
     allow = discord.AllowedMentions.none()
-
     for i, member in enumerate(targets, start=1):
         if DM_JOBS[guild.id]["cancel"]:
             break
-
-        # Skip bots and users who opted out
         if member.bot:
             skipped += 1
             continue
@@ -1292,52 +1016,28 @@ async def _bulk_dm_send(
         if member.id not in set(data.get(str(guild.id), {}).get("users", [])):
             skipped += 1
             continue
-
         text = _format_placeholders(message, guild, member)
-
         try:
-            # clone files for each send
-            send_files = [discord.File(io.BytesIO(f.fp.read() if hasattr(f, "fp") else f), filename=f.filename)
-                          if isinstance(f, discord.File) else f for f in files] if files else None
-
-            # safer rebuild from original bytes
-            if files:
-                send_files = []
-                for orig in files:
-                    if hasattr(orig, "fp"):
-                        orig.fp.seek(0)
-                        data_bytes = orig.fp.read()
-                    else:
-                        data_bytes = b""
-                    send_files.append(discord.File(io.BytesIO(data_bytes), filename=orig.filename))
-
-            await member.send(content=text, files=send_files, allowed_mentions=allow)
+            send_files = []
+            for orig in files or []:
+                if hasattr(orig, "fp"):
+                    orig.fp.seek(0)
+                    b = orig.fp.read()
+                else:
+                    b = b""
+                send_files.append(discord.File(io.BytesIO(b), filename=orig.filename))
+            await member.send(content=text, files=send_files or None, allowed_mentions=allow)
             sent += 1
-        except discord.Forbidden:
+        except (discord.Forbidden, discord.HTTPException):
             failed += 1
-        except discord.HTTPException:
-            failed += 1
-
-        # throttle
         await asyncio.sleep(DM_THROTTLE_SECONDS)
-
-        # update progress every 10 users
         if i % 10 == 0:
-            try:
+            with contextlib.suppress(Exception):
                 await progress.edit(content=f"Sending, {sent} sent, {failed} failed, {skipped} skipped.")
-            except Exception:
-                pass
-
-    try:
+    with contextlib.suppress(Exception):
         await progress.edit(content=f"Done, {sent} sent, {failed} failed, {skipped} skipped.")
-    except Exception:
-        pass
 
-@bot.command(
-    name="dmall",
-    usage="message, supports {user}, {mention}, {guild}, attachments optional",
-    help="DM all opted in members of this server. Respects rate limits."
-)
+@bot.command(name="dmall", usage="message, supports {user}, {mention}, {guild}, attachments optional", help="DM all opted in members of this server.")
 @commands.has_permissions(manage_messages=True)
 async def dmall(ctx: commands.Context, *, message: str):
     if not ctx.guild:
@@ -1346,11 +1046,7 @@ async def dmall(ctx: commands.Context, *, message: str):
     files = await _prepare_attachments(ctx.message)
     await _bulk_dm_send(ctx, ctx.guild.members, message, files)
 
-@bot.command(
-    name="dmrole",
-    usage="role_id message",
-    help="DM all opted in members with a specific role id."
-)
+@bot.command(name="dmrole", usage="role_id message", help="DM all opted in members with a specific role id.")
 @commands.has_permissions(manage_messages=True)
 async def dmrole(ctx: commands.Context, role_id: int, *, message: str):
     if not ctx.guild:
@@ -1361,14 +1057,9 @@ async def dmrole(ctx: commands.Context, role_id: int, *, message: str):
         await ctx.reply("Role not found.")
         return
     files = await _prepare_attachments(ctx.message)
-    targets = [m for m in role.members]
-    await _bulk_dm_send(ctx, targets, message, files)
+    await _bulk_dm_send(ctx, list(role.members), message, files)
 
-@bot.command(
-    name="dmfile",
-    usage="attach a .txt with one user id per line, then add your message after the command",
-    help="DM a custom list of users who opted in, ids only, one per line."
-)
+@bot.command(name="dmfile", usage="attach a .txt with one user id per line, then add your message after the command", help="DM a custom list of opted in users.")
 @commands.has_permissions(manage_messages=True)
 async def dmfile(ctx: commands.Context, *, message: str):
     if not ctx.guild:
@@ -1379,22 +1070,12 @@ async def dmfile(ctx: commands.Context, *, message: str):
         return
     try:
         content = (await ctx.message.attachments[0].read()).decode("utf-8", errors="ignore")
-        ids = []
-        for line in content.splitlines():
-            s = line.strip()
-            if s.isdigit():
-                ids.append(int(s))
+        ids = [int(s.strip()) for s in content.splitlines() if s.strip().isdigit()]
         ids = list(dict.fromkeys(ids))
     except Exception:
         await ctx.reply("Could not read the file.")
         return
-
-    members: list[discord.Member] = []
-    for uid in ids:
-        m = ctx.guild.get_member(uid)
-        if m:
-            members.append(m)
-
+    members: list[discord.Member] = [m for uid in ids if (m := ctx.guild.get_member(uid))]
     files = await _prepare_attachments(ctx.message)
     await _bulk_dm_send(ctx, members, message, files)
 
@@ -1405,8 +1086,7 @@ async def dmcancel(ctx: commands.Context):
     if not g:
         await ctx.reply("No target server configured.")
         return
-    job = DM_JOBS.setdefault(g.id, {"cancel": False})
-    job["cancel"] = True
+    DM_JOBS.setdefault(g.id, {"cancel": False})["cancel"] = True
     await ctx.reply("Cancel requested. The job will stop shortly.")
 
 @bot.command(name="dmpreview", usage="message", help="Preview how placeholders render for you.")
@@ -1418,9 +1098,8 @@ async def dmpreview(ctx: commands.Context, *, message: str):
     sample = _format_placeholders(message, guild, ctx.author)
     await ctx.reply(f"Preview:\n{sample}")
 
-
-
 # ---------- Custom help ----------
+
 @bot.command(name="help", usage="[command]", help="Show this help, or details for one command.")
 async def help_cmd(ctx: commands.Context, command_name: Optional[str] = None):
     if command_name:
@@ -1437,16 +1116,15 @@ async def help_cmd(ctx: commands.Context, command_name: Optional[str] = None):
             emb.add_field(name="Aliases", value=", ".join(cmd.aliases), inline=False)
         await ctx.reply(embed=emb)
         return
-
     emb = discord.Embed(title="Edward Bot help")
-    for cmd in sorted(bot.commands, key=lambda c: c.qualified_name):
-        if cmd.hidden:
+    for c in sorted(bot.commands, key=lambda x: x.qualified_name):
+        if c.hidden:
             continue
-        usage = f"{PREFIX}{cmd.qualified_name} {cmd.usage}" if cmd.usage else f"{PREFIX}{cmd.qualified_name}"
-        emb.add_field(name=usage, value=cmd.help or "No description", inline=False)
+        usage = f"{PREFIX}{c.qualified_name} {c.usage}" if c.usage else f"{PREFIX}{c.qualified_name}"
+        emb.add_field(name=usage, value=c.help or "No description", inline=False)
     await ctx.reply(embed=emb)
 
-# Reload roles without restart, owner only
+# Reload roles, owner only
 @bot.command(name="reloadroles", help="Reload roles.json from disk. Owner only.")
 async def reloadroles(ctx: commands.Context):
     if ctx.guild is None or ctx.author != ctx.guild.owner:
@@ -1460,9 +1138,9 @@ async def reloadroles(ctx: commands.Context):
         await ctx.reply(f"Loaded {len(ALLOWED_ROLE_IDS)} allowed role id(s).")
 
 # ---------- Errors ----------
+
 @bot.event
 async def on_command_error(ctx: commands.Context, error):
-    # Silent ignore for failed role gate
     if isinstance(error, commands.CheckFailure):
         return
     if isinstance(error, commands.MissingPermissions):
@@ -1477,11 +1155,10 @@ async def on_command_error(ctx: commands.Context, error):
         await ctx.reply(f"Error, {type(error).__name__}: {error}")
 
 # ---------- Start ----------
-# ---------- Start ----------
-import asyncio, contextlib
 
 async def main():
-    web_task = asyncio.create_task(start_web())  # keep this only if you run a Web Service on Render
+    # If you use Render Web Service, keep the health server line. For a Background Worker, remove start_web.
+    web_task = asyncio.create_task(start_web())
     try:
         async with bot:
             await bot.start(TOKEN)
