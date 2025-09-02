@@ -367,76 +367,178 @@ async def set_timeout(member: discord.Member, until_dt: Optional[datetime], reas
     except TypeError:
         await member.edit(timeout=until_dt, reason=reason)
 
+
+
 def _appeals_target_channel_id() -> int:
     return APPEALS_CHANNEL_ID if APPEALS_CHANNEL_ID > 0 else MODLOG_CHANNEL_ID
 
-class AppealModal(discord.ui.Modal, title="Appeal form"):
-    def __init__(self, author: discord.abc.User):
-        super().__init__(timeout=300)
-        self.author = author
+# track one live appeal per user
+_APPEAL_BUSY: set[int] = set()
 
-        self.server_name = discord.ui.TextInput(label="Server name, optional", required=False, max_length=100)
-        self.action = discord.ui.TextInput(label="What action are you appealing, ban or mute or warn", required=True, max_length=50)
-        self.what_happened = discord.ui.TextInput(label="What happened", style=discord.TextStyle.long, required=True, max_length=1024)
-        self.why_reconsider = discord.ui.TextInput(label="Why should we reconsider", style=discord.TextStyle.long, required=True, max_length=1024)
-        self.evidence = discord.ui.TextInput(label="Links to evidence, optional", style=discord.TextStyle.long, required=False, max_length=1024)
+async def _dm_interview(
+    user: discord.User,
+    questions: list[tuple[str, bool, bool]],  # (prompt, required, allow_attachments)
+    timeout: float = 180.0
+) -> tuple[bool, dict]:
+    """
+    Ask questions in DM. Returns (ok, answers_dict).
+    Deletes the bot's prompts for privacy. Bots cannot delete user messages in DMs.
+    """
+    answers: dict = {}
+    try:
+        dm = await user.create_dm()
+    except Exception:
+        return False, {}
 
-        for i in [self.server_name, self.action, self.what_happened, self.why_reconsider, self.evidence]:
-            self.add_item(i)
+    async def ask_one(key: str, prompt: str, required: bool, allow_attachments: bool) -> bool:
+        txt = prompt + ("\nType cancel to stop." if required else "\nType skip to leave this blank, or type cancel to stop.")
+        prompt_msg = await dm.send(txt)
 
-    async def on_submit(self, interaction: discord.Interaction):
-        ch_id = _appeals_target_channel_id()
+        def check(m: discord.Message) -> bool:
+            return m.author.id == user.id and m.channel.id == dm.id
 
+        try:
+            msg = await bot.wait_for("message", check=check, timeout=timeout)
+        except asyncio.TimeoutError:
+            with contextlib.suppress(Exception):
+                await prompt_msg.delete()
+            await dm.send("Timed out. Appeal cancelled.")
+            return False
+
+        content = msg.content.strip()
+
+        if content.lower() == "cancel":
+            with contextlib.suppress(Exception):
+                await prompt_msg.delete()
+            await dm.send("Appeal cancelled.")
+            return False
+
+        if not required and content.lower() == "skip":
+            with contextlib.suppress(Exception):
+                await prompt_msg.delete()
+            answers[key] = ""
+            return True
+
+        # collect text and optional attachments
+        links: list[str] = []
+        if allow_attachments and msg.attachments:
+            links = [a.url for a in msg.attachments]
+
+        answers[key] = content if content else ""
+        if links:
+            answers[key + "_attachments"] = links
+
+        # bots can delete their own messages in DMs, not the user's reply
+        with contextlib.suppress(Exception):
+            await prompt_msg.delete()
+
+        return True
+
+    # run the interview
+    for key, required, allow_files in questions:
+        ok = await ask_one(key, key, required, allow_files)
+        if not ok:
+            return False, {}
+
+    # friendly reminder
+    try:
+        await dm.send("Thanks, your appeal was recorded. For privacy, you can delete your replies in this DM. I already deleted my prompts.")
+    except Exception:
+        pass
+
+    return True, answers
+
+@bot.command(name="appeal", help="Start an appeal interview in DMs.")
+async def appeal(ctx: commands.Context):
+    # find target channel early
+    ch_id = _appeals_target_channel_id()
+    if ch_id <= 0:
+        await ctx.reply("Appeals channel is not configured. Ask staff to set APPEALS_CHANNEL_ID or MODLOG_CHANNEL_ID.")
+        return
+
+    # always do the interview in DM
+    author = ctx.author
+    if ctx.guild is not None:
+        # try to open DMs
+        try:
+            await author.send("Hi, I will ask a few questions for your appeal.")
+        except discord.Forbidden:
+            await ctx.reply("I cannot DM you. Open your DMs, then try `%appeal` again. "
+                            + (f"You can also join our appeals server, {APPEALS_JOIN_INVITE}" if APPEALS_JOIN_INVITE else ""))
+            return
+
+    # do not allow two parallel interviews for the same user
+    if author.id in _APPEAL_BUSY:
+        if ctx.guild is None:
+            await ctx.reply("You already have an active appeal interview. Finish that one first.")
+        else:
+            await author.send("You already have an active appeal interview. Finish that one first.")
+        return
+    _APPEAL_BUSY.add(author.id)
+
+    try:
+        ok, answers = await _dm_interview(
+            author,
+            [
+                ("Server name, optional", False, False),
+                ("What action are you appealing, ban or mute or warn", True, False),
+                ("What happened", True, False),
+                ("Why should we reconsider", True, False),
+                ("Links to evidence, optional, you can also attach files", False, True),
+            ],
+            timeout=240.0
+        )
+        if not ok:
+            return
+
+        # build embed
         emb = discord.Embed(title="New appeal", timestamp=now_utc())
-        emb.add_field(name="User", value=f"{self.author}  ({self.author.id})", inline=False)
-        if self.server_name.value:
-            emb.add_field(name="Server", value=self.server_name.value, inline=False)
-        emb.add_field(name="Action", value=self.action.value, inline=False)
-        emb.add_field(name="What happened", value=self.what_happened.value[:1024], inline=False)
-        emb.add_field(name="Why reconsider", value=self.why_reconsider.value[:1024], inline=False)
-        if self.evidence.value:
-            emb.add_field(name="Evidence", value=self.evidence.value[:1024], inline=False)
+        emb.add_field(name="User", value=f"{author}  ({author.id})", inline=False)
+        if answers.get("Server name, optional"):
+            emb.add_field(name="Server", value=answers["Server name, optional"], inline=False)
+        emb.add_field(name="Action", value=answers.get("What action are you appealing, ban or mute or warn", "n, a"), inline=False)
+        emb.add_field(name="What happened", value=answers.get("What happened", "")[:1024], inline=False)
+        emb.add_field(name="Why reconsider", value=answers.get("Why should we reconsider", "")[:1024], inline=False)
 
-        case_id = f"APL-{now_utc().strftime('%Y%m%d-%H%M')}-{str(self.author.id)[-4:]}"
+        ev_lines = []
+        if answers.get("Links to evidence, optional"):
+            ev_lines.append(answers["Links to evidence, optional"])
+        for url in answers.get("Links to evidence, optional_attachments", []):
+            ev_lines.append(url)
+        if ev_lines:
+            ev = "\n".join(ev_lines)
+            emb.add_field(name="Evidence", value=ev[:1024], inline=False)
+
+        case_id = f"APL-{now_utc().strftime('%Y%m%d-%H%M')}-{str(author.id)[-4:]}"
         emb.set_footer(text=f"Appeal id {case_id}")
 
+        # send to staff channel
         delivered = False
-        if ch_id > 0:
-            try:
-                ch = interaction.client.get_channel(ch_id) or await interaction.client.fetch_channel(ch_id)
-                if isinstance(ch, (discord.TextChannel, discord.Thread)):
-                    await ch.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
-                    delivered = True
-            except Exception as e:
-                print("[appeal] post failed,", e)
-
-        if delivered:
-            await interaction.response.send_message(f"Thanks, your appeal was sent. Case id, {case_id}.")
-        else:
-            extra = f" You can also join our appeals server, {APPEALS_JOIN_INVITE}" if APPEALS_JOIN_INVITE else ""
-            await interaction.response.send_message(
-                "Thanks, your appeal was recorded, but I could not post it to the staff channel. "
-                "Ask staff to set APPEALS_CHANNEL_ID or MODLOG_CHANNEL_ID." + extra
-            )
-
-    async def on_error(self, interaction: discord.Interaction, error: Exception):
-        print("[appeal] modal error,", repr(error))
-        with contextlib.suppress(Exception):
-            await interaction.response.send_message("Sorry, something went wrong while submitting your appeal.")
-
-class AppealStartView(discord.ui.View):
-    # persistent view, so clicks work after restarts
-    def __init__(self):
-        super().__init__(timeout=None)
-
-    @discord.ui.button(label="Open appeal form", style=discord.ButtonStyle.primary, custom_id="appeal:open")
-    async def open(self, interaction: discord.Interaction, _button: discord.ui.Button):
         try:
-            await interaction.response.send_modal(AppealModal(author=interaction.user))
+            ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
+            if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                await ch.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+                delivered = True
         except Exception as e:
-            print("[appeal] open button error,", repr(e))
+            print("[appeal] post failed,", repr(e))
+
+        # confirm to the user
+        try:
+            if delivered:
+                await author.send(f"Thanks, your appeal was sent to the moderators. Case id, {case_id}.")
+            else:
+                extra = f" You can also join our appeals server, {APPEALS_JOIN_INVITE}" if APPEALS_JOIN_INVITE else ""
+                await author.send("Thanks, your appeal was recorded, but I could not post it to the staff channel." + extra)
+        except Exception:
+            pass
+
+        # if the command was used in a server channel, acknowledge there too
+        if ctx.guild is not None:
             with contextlib.suppress(Exception):
-                await interaction.response.send_message("Could not open the form, try again.")
+                await ctx.reply("I DMd you the appeal questions. Check your DMs.")
+
+    finally:
+        _APPEAL_BUSY.discard(author.id)
 
 
 
@@ -592,15 +694,14 @@ async def role_gate(ctx: commands.Context) -> bool:
 # ---------- Events ----------
 @bot.event
 async def setup_hook():
-    # register persistent UI once, survives restarts
-    bot.add_view(AppealStartView())
+    # nothing to register for the DM interview version
+    pass
 
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}, prefix {PREFIX}")
-    asyncio.create_task(storage_bootstrap())   # your cache warm up
-    # optional, set a presence
-    # await bot.change_presence(activity=discord.Game(name=f"{PREFIX}help"))
+    asyncio.create_task(storage_bootstrap())
+
 
 
 
@@ -622,7 +723,7 @@ async def appeal(ctx: commands.Context):
     if _appeals_target_channel_id() <= 0 and not APPEALS_JOIN_INVITE:
         await ctx.reply("Appeals channel is not configured, ask staff to set APPEALS_CHANNEL_ID or MODLOG_CHANNEL_ID.")
         return
-    await ctx.reply("Tap the button to open the appeal form.", view=AppealStartView())
+    await ctx.reply("Tap the button to open the appeal form.", ())
 
 
 
