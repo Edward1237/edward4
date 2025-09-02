@@ -1289,13 +1289,15 @@ async def dmpreview(ctx: commands.Context, *, message: str):
 
 # ---------- Help and errors ----------
 
+# ========= Help with button pagination =========
+
 def _command_usage(cmd: commands.Command) -> str:
     return f"{PREFIX}{cmd.qualified_name} {cmd.usage}" if cmd.usage else f"{PREFIX}{cmd.qualified_name}"
 
 def _visible_commands() -> list[commands.Command]:
     return sorted([c for c in bot.commands if not c.hidden], key=lambda c: c.qualified_name)
 
-def _build_help_pages(page_size: int = 20) -> list[discord.Embed]:
+def _build_help_pages(page_size: int = 15) -> list[discord.Embed]:
     cmds = _visible_commands()
     pages: list[discord.Embed] = []
     page = discord.Embed(title="Edward Bot help")
@@ -1318,8 +1320,63 @@ def _build_help_pages(page_size: int = 20) -> list[discord.Embed]:
 
     return pages
 
+class HelpPaginator(discord.ui.View):
+    def __init__(self, pages: list[discord.Embed], author_id: int, timeout: float = 120):
+        super().__init__(timeout=timeout)
+        self.pages = pages
+        self.index = 0
+        self.author_id = author_id
+        self.message: Optional[discord.Message] = None
+        self._update_state()
+
+    def _update_state(self):
+        # enable or disable buttons based on position
+        self.prev_button.disabled = self.index <= 0
+        self.next_button.disabled = self.index >= len(self.pages) - 1
+
+    async def _ensure_author(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.author_id:
+            await interaction.response.send_message("Only the person who used the command can press these buttons.", ephemeral=True)
+            return False
+        return True
+
+    @discord.ui.button(label="Prev", style=discord.ButtonStyle.secondary)
+    async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ensure_author(interaction):
+            return
+        if self.index > 0:
+            self.index -= 1
+            self._update_state()
+            await interaction.response.edit_message(embed=self.pages[self.index], view=self)
+
+    @discord.ui.button(label="Next", style=discord.ButtonStyle.primary)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ensure_author(interaction):
+            return
+        if self.index < len(self.pages) - 1:
+            self.index += 1
+            self._update_state()
+            await interaction.response.edit_message(embed=self.pages[self.index], view=self)
+
+    @discord.ui.button(label="Close", style=discord.ButtonStyle.danger)
+    async def close_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not await self._ensure_author(interaction):
+            return
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(view=self)
+
+    async def on_timeout(self):
+        # disable controls when the view times out
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            with contextlib.suppress(Exception):
+                await self.message.edit(view=self)
+
 @bot.command(name="help", usage="[command]", help="Show this help, or details for one command.")
 async def help_cmd(ctx: commands.Context, command_name: Optional[str] = None):
+    # detailed help for one command
     if command_name:
         cmd = bot.get_command(command_name)
         if not cmd or cmd.hidden:
@@ -1331,11 +1388,18 @@ async def help_cmd(ctx: commands.Context, command_name: Optional[str] = None):
             emb.add_field(name="Description", value=cmd.help, inline=False)
         if cmd.aliases:
             emb.add_field(name="Aliases", value=", ".join(cmd.aliases), inline=False)
-        await ctx.reply(embed=emb)
+        await ctx.reply(embed=emb, allowed_mentions=discord.AllowedMentions.none())
         return
 
-    for emb in _build_help_pages(page_size=20):
-        await ctx.reply(embed=emb)
+    # paginated help
+    pages = _build_help_pages(page_size=15)  # keep under 25 to respect Discord limits
+    if not pages:
+        await ctx.reply("No commands available.")
+        return
+
+    view = HelpPaginator(pages, author_id=ctx.author.id, timeout=120)
+    msg = await ctx.reply(embed=pages[0], view=view, allowed_mentions=discord.AllowedMentions.none())
+    view.message = msg
 
 
 @bot.command(name="reloadroles", help="Reload roles.json from disk. Owner only.")
