@@ -246,6 +246,9 @@ MODLOG_CHANNEL_ID = int(os.getenv("MODLOG_CHANNEL_ID", "0"))
 
 PREFIX = "%"
 
+APPEALS_CHANNEL_ID = int(os.getenv("APPEALS_CHANNEL_ID", "0"))  # falls back to MODLOG_CHANNEL_ID if 0
+
+
 # Ticket env
 TICKETS_GUILD_ID = int(os.getenv("TICKETS_GUILD_ID", "0"))
 TICKETS_CATEGORY_ID = int(os.getenv("TICKETS_CATEGORY_ID", "0"))
@@ -264,8 +267,8 @@ ROLES_FILE = "roles.json"
 ALLOWED_ROLE_IDS: Set[int] = set()
 
 # Which commands are public for everyone
-PUBLIC_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus", "ping"}
-PUBLIC_DM_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus", "ping"}
+PUBLIC_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus", "ping","appeal"}
+PUBLIC_DM_COMMANDS = {"ticket", "help", "dmoptin", "dmoptout", "dmstatus", "ping","appeal"}
 
 # top of file
 import os, asyncio
@@ -362,6 +365,111 @@ async def set_timeout(member: discord.Member, until_dt: Optional[datetime], reas
         await member.timeout(until_dt, reason=reason)
     except TypeError:
         await member.edit(timeout=until_dt, reason=reason)
+
+# ---------- Appeals, DM modal ----------
+def _appeals_target_channel_id() -> int:
+    return APPEALS_CHANNEL_ID if APPEALS_CHANNEL_ID > 0 else MODLOG_CHANNEL_ID
+
+class AppealModal(discord.ui.Modal, title="Appeal form"):
+    def __init__(self, author: discord.abc.User):
+        super().__init__(timeout=300)
+        self.author = author
+
+        self.server_name = discord.ui.TextInput(
+            label="Server name, optional",
+            required=False,
+            max_length=100,
+            placeholder="Type the server name if you know it"
+        )
+        self.action = discord.ui.TextInput(
+            label="What action are you appealing, ban, mute, warn",
+            required=True,
+            max_length=50,
+            placeholder="ban, mute, warn, other"
+        )
+        self.what_happened = discord.ui.TextInput(
+            label="What happened",
+            style=discord.TextStyle.long,
+            required=True,
+            max_length=1024,
+            placeholder="Tell us what led to the action"
+        )
+        self.why_reconsider = discord.ui.TextInput(
+            label="Why should we reconsider",
+            style=discord.TextStyle.long,
+            required=True,
+            max_length=1024,
+            placeholder="Explain why we should lift or reduce it"
+        )
+        self.evidence = discord.ui.TextInput(
+            label="Links to evidence, optional",
+            style=discord.TextStyle.long,
+            required=False,
+            max_length=1024,
+            placeholder="Paste links, Drive, Imgur, YouTube, etc"
+        )
+
+        # add inputs to the modal
+        for i in [self.server_name, self.action, self.what_happened, self.why_reconsider, self.evidence]:
+            self.add_item(i)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        ch_id = _appeals_target_channel_id()
+        # build embed
+        emb = discord.Embed(title="New appeal", timestamp=now_utc())
+        emb.add_field(name="User", value=f"{self.author}  ({self.author.id})", inline=False)
+        if self.server_name.value:
+            emb.add_field(name="Server", value=self.server_name.value, inline=False)
+        emb.add_field(name="Action", value=self.action.value, inline=False)
+        emb.add_field(name="What happened", value=self.what_happened.value[:1024], inline=False)
+        emb.add_field(name="Why reconsider", value=self.why_reconsider.value[:1024], inline=False)
+        if self.evidence.value:
+            emb.add_field(name="Evidence", value=self.evidence.value[:1024], inline=False)
+
+        # cheap readable id
+        case_id = f"APL-{now_utc().strftime('%Y%m%d-%H%M')}-{str(self.author.id)[-4:]}"
+        emb.set_footer(text=f"Appeal id {case_id}")
+
+        sent_ok = False
+        if ch_id > 0:
+            ch = interaction.client.get_channel(ch_id) or await interaction.client.fetch_channel(ch_id)
+            if isinstance(ch, (discord.TextChannel, discord.Thread)):
+                with contextlib.suppress(Exception):
+                    await ch.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
+                    sent_ok = True
+
+        # acknowledge in DM
+        if sent_ok:
+            await interaction.response.send_message(
+                f"Thanks, your appeal was sent to the moderators. Case id, {case_id}.",
+                ephemeral=False
+            )
+        else:
+            await interaction.response.send_message(
+                "Thanks, your appeal was recorded, but I could not deliver it to the staff channel. "
+                "Please tell a moderator, the bot needs MODLOG_CHANNEL_ID or APPEALS_CHANNEL_ID set.",
+                ephemeral=False
+            )
+
+class AppealStartView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=180)
+
+    @discord.ui.button(label="Open appeal form", style=discord.ButtonStyle.primary)
+    async def open(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(AppealModal(author=interaction.user))
+
+@bot.command(name="appeal", help="Open the appeal form. Use this in DMs with the bot.")
+async def appeal(ctx: commands.Context):
+    if ctx.guild is not None:
+        await ctx.reply("Please DM me and run `%appeal` here so we can handle it privately.")
+        return
+    # quick check so we can warn early if channel is unset
+    if _appeals_target_channel_id() <= 0:
+        await ctx.reply("Appeals channel is not configured. Ask staff to set APPEALS_CHANNEL_ID or MODLOG_CHANNEL_ID.")
+        return
+    await ctx.reply("Tap the button to open the appeal form.", view=AppealStartView())
+
 
 # ---------- Bulk DM helpers ----------
 from typing import Iterable
