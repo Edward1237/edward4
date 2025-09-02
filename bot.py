@@ -386,6 +386,7 @@ class AppealModal(discord.ui.Modal, title="Appeal form"):
 
     async def on_submit(self, interaction: discord.Interaction):
         ch_id = _appeals_target_channel_id()
+
         emb = discord.Embed(title="New appeal", timestamp=now_utc())
         emb.add_field(name="User", value=f"{self.author}  ({self.author.id})", inline=False)
         if self.server_name.value:
@@ -395,6 +396,7 @@ class AppealModal(discord.ui.Modal, title="Appeal form"):
         emb.add_field(name="Why reconsider", value=self.why_reconsider.value[:1024], inline=False)
         if self.evidence.value:
             emb.add_field(name="Evidence", value=self.evidence.value[:1024], inline=False)
+
         case_id = f"APL-{now_utc().strftime('%Y%m%d-%H%M')}-{str(self.author.id)[-4:]}"
         emb.set_footer(text=f"Appeal id {case_id}")
 
@@ -405,26 +407,37 @@ class AppealModal(discord.ui.Modal, title="Appeal form"):
                 if isinstance(ch, (discord.TextChannel, discord.Thread)):
                     await ch.send(embed=emb, allowed_mentions=discord.AllowedMentions.none())
                     delivered = True
-            except Exception:
-                delivered = False
+            except Exception as e:
+                print("[appeal] post failed,", e)
 
         if delivered:
-            await interaction.response.send_message(f"Thanks, your appeal was sent. Case id, {case_id}.", ephemeral=False)
+            await interaction.response.send_message(f"Thanks, your appeal was sent. Case id, {case_id}.")
         else:
             extra = f" You can also join our appeals server, {APPEALS_JOIN_INVITE}" if APPEALS_JOIN_INVITE else ""
             await interaction.response.send_message(
-                "Thanks, your appeal was recorded, but I could not post it to the staff channel, ask a moderator to set APPEALS_CHANNEL_ID or MODLOG_CHANNEL_ID." + extra,
-                ephemeral=False
+                "Thanks, your appeal was recorded, but I could not post it to the staff channel. "
+                "Ask staff to set APPEALS_CHANNEL_ID or MODLOG_CHANNEL_ID." + extra
             )
 
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        print("[appeal] modal error,", repr(error))
+        with contextlib.suppress(Exception):
+            await interaction.response.send_message("Sorry, something went wrong while submitting your appeal.")
+
 class AppealStartView(discord.ui.View):
-    # timeout None, persistent view, the button uses a fixed custom id
+    # persistent view, so clicks work after restarts
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="Open appeal form", style=discord.ButtonStyle.primary, custom_id="appeal:open")
     async def open(self, interaction: discord.Interaction, _button: discord.ui.Button):
-        await interaction.response.send_modal(AppealModal(author=interaction.user))
+        try:
+            await interaction.response.send_modal(AppealModal(author=interaction.user))
+        except Exception as e:
+            print("[appeal] open button error,", repr(e))
+            with contextlib.suppress(Exception):
+                await interaction.response.send_message("Could not open the form, try again.")
+
 
 
 
@@ -578,12 +591,18 @@ async def role_gate(ctx: commands.Context) -> bool:
 
 # ---------- Events ----------
 @bot.event
+async def setup_hook():
+    # register persistent UI once, survives restarts
+    bot.add_view(AppealStartView())
+
+@bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}, prefix {PREFIX}")
-    if not getattr(bot, "_appeal_view_registered", False):
-        bot.add_view(AppealStartView())  # persistent, survives restarts
-        bot._appeal_view_registered = True
-    asyncio.create_task(storage_bootstrap())
+    asyncio.create_task(storage_bootstrap())   # your cache warm up
+    # optional, set a presence
+    # await bot.change_presence(activity=discord.Game(name=f"{PREFIX}help"))
+
+
 
 
 # ---------- Moderation Commands ----------
@@ -604,6 +623,7 @@ async def appeal(ctx: commands.Context):
         await ctx.reply("Appeals channel is not configured, ask staff to set APPEALS_CHANNEL_ID or MODLOG_CHANNEL_ID.")
         return
     await ctx.reply("Tap the button to open the appeal form.", view=AppealStartView())
+
 
 
 
