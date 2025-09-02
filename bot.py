@@ -25,6 +25,190 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
+# ---------- Discord storage in a different server ----------
+import os
+import io
+import json
+import asyncio
+from typing import Optional, Tuple
+
+STORAGE_GUILD_ID = int(os.getenv("STORAGE_GUILD_ID", "0"))
+STORAGE_WARN_CH_ID = int(os.getenv("STORAGE_WARN_CH_ID", "0"))
+STORAGE_TICKETS_CH_ID = int(os.getenv("STORAGE_TICKETS_CH_ID", "0"))
+STORAGE_OPTIN_CH_ID = int(os.getenv("STORAGE_OPTIN_CH_ID", "0"))
+
+# in memory caches
+_WARN_CACHE: dict = {}
+_TICKETS_CACHE: dict = {}
+_OPTIN_CACHE: dict = {}
+_storage_ready = asyncio.Event()
+
+def _storage_targets() -> list[Tuple[str, int]]:
+    return [
+        ("warnings", STORAGE_WARN_CH_ID),
+        ("tickets", STORAGE_TICKETS_CH_ID),
+        ("dm_optin", STORAGE_OPTIN_CH_ID),
+    ]
+
+def _cache_for(name: str) -> dict:
+    return {"warnings": _WARN_CACHE, "tickets": _TICKETS_CACHE, "dm_optin": _OPTIN_CACHE}[name]
+
+async def _get_text_channel(cid: int) -> Optional[discord.TextChannel]:
+    ch = bot.get_channel(cid)
+    if ch is None:
+        try:
+            ch = await bot.fetch_channel(cid)
+        except Exception:
+            ch = None
+    return ch if isinstance(ch, discord.TextChannel) else None
+
+async def _ensure_index_message(channel: discord.TextChannel, tag: str) -> discord.Message:
+    """
+    Keep one pinned index message per storage channel, content is a small tag.
+    """
+    try:
+        pins = await channel.pins()
+    except discord.Forbidden:
+        pins = []
+    for m in pins:
+        if m.author.id == bot.user.id and tag in (m.content or ""):
+            return m
+    msg = await channel.send(f"[storage] {tag}")
+    try:
+        await msg.pin()
+    except Exception:
+        pass
+    return msg
+
+async def _find_latest_attachment(channel: discord.TextChannel, filename: str) -> Optional[discord.Attachment]:
+    """
+    Scan recent history for the newest attachment with this filename.
+    """
+    async for m in channel.history(limit=100, oldest_first=False):
+        if m.author.id != bot.user.id:
+            continue
+        for a in m.attachments:
+            if a.filename == filename:
+                return a
+    return None
+
+async def _load_one(name: str, cid: int) -> dict:
+    """
+    Load JSON from the storage channel by reading the latest attachment.
+    """
+    ch = await _get_text_channel(cid)
+    if not ch:
+        print(f"[storage] channel {cid} not found for {name}, using empty")
+        return {}
+    await _ensure_index_message(ch, f"{name}.json")
+    att = await _find_latest_attachment(ch, f"{name}.json")
+    if not att:
+        print(f"[storage] no existing file for {name}, using empty")
+        return {}
+    try:
+        data_bytes = await att.read()
+        obj = json.loads(data_bytes.decode("utf-8"))
+        return obj if isinstance(obj, dict) else {}
+    except Exception as e:
+        print(f"[storage] failed to read {name}, {e}")
+        return {}
+
+async def _save_one(name: str, cid: int, data: dict) -> None:
+    """
+    Save JSON as a fresh attachment named {name}.json, keep a short index message pinned.
+    Also prune older bot messages with the same filename, keep the latest 3.
+    """
+    ch = await _get_text_channel(cid)
+    if not ch:
+        print(f"[storage] cannot save, channel {cid} missing for {name}")
+        return
+
+    # ensure index exists
+    await _ensure_index_message(ch, f"{name}.json")
+
+    # upload new attachment
+    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    file = discord.File(io.BytesIO(payload), filename=f"{name}.json")
+    try:
+        await ch.send(file=file, content=f"[storage] update {name}.json")
+    except Exception as e:
+        print(f"[storage] failed to upload {name}, {e}")
+        return
+
+    # prune older files to keep the channel tidy
+    kept = 0
+    to_delete: list[discord.Message] = []
+    async for m in ch.history(limit=200, oldest_first=False):
+        if m.author.id != bot.user.id:
+            continue
+        same = any(a.filename == f"{name}.json" for a in m.attachments)
+        if not same:
+            continue
+        kept += 1
+        if kept > 3:
+            to_delete.append(m)
+    for m in to_delete:
+        with contextlib.suppress(Exception):
+            await m.delete()
+
+async def storage_bootstrap():
+    """
+    Load all datasets once after login.
+    """
+    try:
+        if not STORAGE_GUILD_ID:
+            print("[storage] not configured, set STORAGE_* env vars")
+            _storage_ready.set()
+            return
+
+        # warm up caches
+        global _WARN_CACHE, _TICKETS_CACHE, _OPTIN_CACHE
+        for name, cid in _storage_targets():
+            data = await _load_one(name, cid) if cid else {}
+            if name == "warnings":
+                _WARN_CACHE = data
+            elif name == "tickets":
+                _TICKETS_CACHE = data
+            elif name == "dm_optin":
+                _OPTIN_CACHE = data
+
+        _storage_ready.set()
+        print("[storage] ready")
+    except Exception as e:
+        print(f"[storage] bootstrap failed, {e}")
+        _storage_ready.set()
+
+def _schedule_save(name: str, cid: int):
+    data = _cache_for(name)
+    if cid:
+        asyncio.create_task(_save_one(name, cid, data))
+
+# public helpers, same names you already use
+def load_warnings() -> dict:
+    return _WARN_CACHE or {}
+
+def save_warnings(data: dict) -> None:
+    _WARN_CACHE.clear()
+    _WARN_CACHE.update(data)
+    _schedule_save("warnings", STORAGE_WARN_CH_ID)
+
+def load_tickets() -> dict:
+    return _TICKETS_CACHE or {}
+
+def save_tickets(data: dict) -> None:
+    _TICKETS_CACHE.clear()
+    _TICKETS_CACHE.update(data)
+    _schedule_save("tickets", STORAGE_TICKETS_CH_ID)
+
+def _load_optins() -> dict:
+    return _OPTIN_CACHE or {}
+
+def _save_optins(data: dict) -> None:
+    _OPTIN_CACHE.clear()
+    _OPTIN_CACHE.update(data)
+    _schedule_save("dm_optin", STORAGE_OPTIN_CH_ID)
+
+
 
 
 # ---------- Config ----------
@@ -327,6 +511,7 @@ async def role_gate(ctx: commands.Context) -> bool:
 @bot.event
 async def on_ready():
     print(f"Logged in as {bot.user}, prefix {PREFIX}")
+    asyncio.create_task(storage_bootstrap())
 
 # ---------- Moderation Commands ----------
 @bot.command(usage="@user reason", help="Ban a user, then DM them the reason.")
