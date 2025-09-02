@@ -1207,14 +1207,6 @@ async def on_command_error(ctx: commands.Context, error):
 
 # ---------- Start ----------
 async def main():
-    # start the HTTP server before logging in, Render will see an open port
-    asyncio.create_task(start_web())
-    await bot.start(TOKEN)
-
-if __name__ == "__main__":
-    asyncio.run(main())
-
-async def main():
     # start the tiny HTTP server first if you run as a Web Service on Render
     web_task = asyncio.create_task(start_web())  # remove this line if you run as a Background Worker
     try:
