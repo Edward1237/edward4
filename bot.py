@@ -35,11 +35,13 @@ STORAGE_GUILD_ID = int(os.getenv("STORAGE_GUILD_ID", "0"))
 STORAGE_WARN_CH_ID = int(os.getenv("STORAGE_WARN_CH_ID", "0"))
 STORAGE_TICKETS_CH_ID = int(os.getenv("STORAGE_TICKETS_CH_ID", "0"))
 STORAGE_OPTIN_CH_ID = int(os.getenv("STORAGE_OPTIN_CH_ID", "0"))
+STORAGE_BANS_CH_ID = int(os.getenv("STORAGE_BANS_CH_ID", "0"))
 
 # in memory caches
 _WARN_CACHE: dict = {}
 _TICKETS_CACHE: dict = {}
 _OPTIN_CACHE: dict = {}
+_BANS_CACHE: dict = {}  # key, user_id string, value, list of ban events, newest last
 _storage_ready = asyncio.Event()
 
 def _storage_targets() -> list[Tuple[str, int]]:
@@ -47,6 +49,7 @@ def _storage_targets() -> list[Tuple[str, int]]:
         ("warnings", STORAGE_WARN_CH_ID),
         ("tickets", STORAGE_TICKETS_CH_ID),
         ("dm_optin", STORAGE_OPTIN_CH_ID),
+        ("bans", STORAGE_BANS_CH_ID),
     ]
 
 def _cache_for(name: str) -> dict:
@@ -162,7 +165,7 @@ async def storage_bootstrap():
             return
 
         # warm up caches
-        global _WARN_CACHE, _TICKETS_CACHE, _OPTIN_CACHE
+        global _WARN_CACHE, _TICKETS_CACHE, _OPTIN_CACHE, _BANS_CACHE
         for name, cid in _storage_targets():
             data = await _load_one(name, cid) if cid else {}
             if name == "warnings":
@@ -171,6 +174,8 @@ async def storage_bootstrap():
                 _TICKETS_CACHE = data
             elif name == "dm_optin":
                 _OPTIN_CACHE = data
+            elif name == "bans":
+                _BANS_CACHE = data
 
         _storage_ready.set()
         print("[storage] ready")
@@ -207,6 +212,15 @@ def _save_optins(data: dict) -> None:
     _OPTIN_CACHE.clear()
     _OPTIN_CACHE.update(data)
     _schedule_save("dm_optin", STORAGE_OPTIN_CH_ID)
+
+def load_bans() -> dict:
+    return _BANS_CACHE or {}
+
+def save_bans(data: dict) -> None:
+    _BANS_CACHE.clear()
+    _BANS_CACHE.update(data)
+    _schedule_save("bans", STORAGE_BANS_CH_ID)
+
 
 # imports ...
 
@@ -372,38 +386,55 @@ async def set_timeout(member: discord.Member, until_dt: Optional[datetime], reas
 def _appeals_target_channel_id() -> int:
     return APPEALS_CHANNEL_ID if APPEALS_CHANNEL_ID > 0 else MODLOG_CHANNEL_ID
 
-# track one live appeal per user
 _APPEAL_BUSY: set[int] = set()
 
-async def _dm_interview(
-    user: discord.User,
-    questions: list[tuple[str, bool, bool]],  # (prompt, required, allow_attachments)
-    timeout: float = 180.0
-) -> tuple[bool, dict]:
+async def _send_dm_embed(ch: discord.DMChannel, title: str, desc: str) -> discord.Message:
+    emb = discord.Embed(title=title, description=desc, color=discord.Color.blurple())
+    emb.set_footer(text="Type cancel to stop at any time")
+    return await ch.send(embed=emb)
+
+async def _dm_interview_pretty(user: discord.User) -> tuple[bool, dict, list[str]]:
     """
-    Ask questions in DM. Returns (ok, answers_dict).
-    Deletes the bot's prompts for privacy. Bots cannot delete user messages in DMs.
+    Ask questions in DM with embeds, gather text and optional links, return ok, answers, attachment urls.
+    Bot deletes its prompts for privacy. Bots cannot delete the user's replies.
     """
-    answers: dict = {}
     try:
         dm = await user.create_dm()
     except Exception:
-        return False, {}
+        return False, {}, []
 
-    async def ask_one(key: str, prompt: str, required: bool, allow_attachments: bool) -> bool:
-        txt = prompt + ("\nType cancel to stop." if required else "\nType skip to leave this blank, or type cancel to stop.")
-        prompt_msg = await dm.send(txt)
+    q = [
+        ("Server name, optional", False, False),
+        ("What action are you appealing, ban or mute or warn", True, False),
+        ("What happened", True, False),
+        ("Why should we reconsider", True, False),
+        ("Links to evidence, optional, you can also attach files", False, True),
+    ]
 
-        def check(m: discord.Message) -> bool:
-            return m.author.id == user.id and m.channel.id == dm.id
+    answers: dict = {}
+    attach_urls: list[str] = []
 
+    intro = await _send_dm_embed(
+        dm,
+        "Appeal start",
+        "I will ask a few questions. Reply within 4 minutes for each question."
+    )
+    with contextlib.suppress(Exception):
+        await asyncio.sleep(1)
+        await intro.delete()
+
+    def check(m: discord.Message) -> bool:
+        return m.author.id == user.id and m.channel.id == dm.id
+
+    for idx, (prompt, required, allow_files) in enumerate(q, start=1):
+        prompt_msg = await _send_dm_embed(dm, f"Step {idx}", prompt + ("\nRequired" if required else "\nOptional"))
         try:
-            msg = await bot.wait_for("message", check=check, timeout=timeout)
+            msg = await bot.wait_for("message", check=check, timeout=240)
         except asyncio.TimeoutError:
             with contextlib.suppress(Exception):
                 await prompt_msg.delete()
-            await dm.send("Timed out. Appeal cancelled.")
-            return False
+            await dm.send("Timed out, appeal cancelled.")
+            return False, {}, []
 
         content = msg.content.strip()
 
@@ -411,108 +442,90 @@ async def _dm_interview(
             with contextlib.suppress(Exception):
                 await prompt_msg.delete()
             await dm.send("Appeal cancelled.")
-            return False
+            return False, {}, []
 
-        if not required and content.lower() == "skip":
+        if not content and required and not msg.attachments:
             with contextlib.suppress(Exception):
                 await prompt_msg.delete()
-            answers[key] = ""
-            return True
+            await dm.send("That step is required, appeal cancelled.")
+            return False, {}, []
 
-        # collect text and optional attachments
-        links: list[str] = []
-        if allow_attachments and msg.attachments:
-            links = [a.url for a in msg.attachments]
+        if allow_files and msg.attachments:
+            for a in msg.attachments:
+                with contextlib.suppress(Exception):
+                    attach_urls.append(a.url)
 
-        answers[key] = content if content else ""
-        if links:
-            answers[key + "_attachments"] = links
-
-        # bots can delete their own messages in DMs, not the user's reply
+        answers[prompt] = content
         with contextlib.suppress(Exception):
             await prompt_msg.delete()
 
-        return True
-
-    # run the interview
-    for key, required, allow_files in questions:
-        ok = await ask_one(key, key, required, allow_files)
-        if not ok:
-            return False, {}
-
-    # friendly reminder
     try:
-        await dm.send("Thanks, your appeal was recorded. For privacy, you can delete your replies in this DM. I already deleted my prompts.")
+        await dm.send("Thanks, your appeal was recorded. You can delete your replies in this DM if you want extra privacy.")
     except Exception:
         pass
 
-    return True, answers
+    return True, answers, attach_urls
 
-@bot.command(name="appeal", help="Start an appeal interview in DMs.")
+@bot.command(name="appeal", help="Start an appeal interview in DMs, then send it to the staff channel.")
 async def appeal(ctx: commands.Context):
-    # find target channel early
     ch_id = _appeals_target_channel_id()
     if ch_id <= 0:
         await ctx.reply("Appeals channel is not configured. Ask staff to set APPEALS_CHANNEL_ID or MODLOG_CHANNEL_ID.")
         return
 
-    # always do the interview in DM
     author = ctx.author
+    # always move to DM
     if ctx.guild is not None:
-        # try to open DMs
         try:
-            await author.send("Hi, I will ask a few questions for your appeal.")
+            await author.send("Hi, I will collect your appeal here in DM.")
         except discord.Forbidden:
-            await ctx.reply("I cannot DM you. Open your DMs, then try `%appeal` again. "
-                            + (f"You can also join our appeals server, {APPEALS_JOIN_INVITE}" if APPEALS_JOIN_INVITE else ""))
+            await ctx.reply("I cannot DM you. Please enable DMs from server members, then try again."
+                            + (f" You can also join our appeals server, {APPEALS_JOIN_INVITE}" if APPEALS_JOIN_INVITE else ""))
             return
 
-    # do not allow two parallel interviews for the same user
     if author.id in _APPEAL_BUSY:
         if ctx.guild is None:
-            await ctx.reply("You already have an active appeal interview. Finish that one first.")
+            await ctx.reply("You already have an active appeal, finish that one first.")
         else:
-            await author.send("You already have an active appeal interview. Finish that one first.")
+            await author.send("You already have an active appeal, finish that one first.")
         return
     _APPEAL_BUSY.add(author.id)
 
     try:
-        ok, answers = await _dm_interview(
-            author,
-            [
-                ("Server name, optional", False, False),
-                ("What action are you appealing, ban or mute or warn", True, False),
-                ("What happened", True, False),
-                ("Why should we reconsider", True, False),
-                ("Links to evidence, optional, you can also attach files", False, True),
-            ],
-            timeout=240.0
-        )
+        ok, answers, attach_urls = await _dm_interview_pretty(author)
         if not ok:
             return
 
-        # build embed
-        emb = discord.Embed(title="New appeal", timestamp=now_utc())
-        emb.add_field(name="User", value=f"{author}  ({author.id})", inline=False)
-        if answers.get("Server name, optional"):
-            emb.add_field(name="Server", value=answers["Server name, optional"], inline=False)
-        emb.add_field(name="Action", value=answers.get("What action are you appealing, ban or mute or warn", "n, a"), inline=False)
-        emb.add_field(name="What happened", value=answers.get("What happened", "")[:1024], inline=False)
-        emb.add_field(name="Why reconsider", value=answers.get("Why should we reconsider", "")[:1024], inline=False)
+        # look up any known ban for context
+        ban = await lookup_known_ban(author.id)
 
-        ev_lines = []
-        if answers.get("Links to evidence, optional"):
-            ev_lines.append(answers["Links to evidence, optional"])
-        for url in answers.get("Links to evidence, optional_attachments", []):
-            ev_lines.append(url)
-        if ev_lines:
-            ev = "\n".join(ev_lines)
-            emb.add_field(name="Evidence", value=ev[:1024], inline=False)
+        # build staff embed
+        emb = discord.Embed(
+            title="New appeal",
+            description="A user submitted an appeal",
+            color=discord.Color.orange(),
+            timestamp=now_utc()
+        )
+        emb.set_author(name=str(author), icon_url=getattr(author.display_avatar, "url", discord.Embed.Empty))
+        emb.add_field(name="User", value=f"{author.mention}  ({author.id})", inline=False)
+        if answers.get("Server name, optional"):
+            emb.add_field(name="Server, claimed", value=answers["Server name, optional"][:256], inline=False)
+        emb.add_field(name="Action", value=answers.get("What action are you appealing, ban or mute or warn", "n, a")[:256], inline=False)
+        emb.add_field(name="What happened", value=(answers.get("What happened") or "")[:1024], inline=False)
+        emb.add_field(name="Why reconsider", value=(answers.get("Why should we reconsider") or "")[:1024], inline=False)
+
+        if attach_urls:
+            ev = "\n".join(attach_urls)
+            emb.add_field(name="Evidence links", value=ev[:1024], inline=False)
+
+        if ban:
+            ban_text = f"Guild, {ban.get('guild_name','unknown')}  id {ban.get('guild_id','n, a')}\nReason, {ban.get('reason','No reason recorded')}"
+            emb.add_field(name="Known ban, auto lookup", value=ban_text[:1024], inline=False)
 
         case_id = f"APL-{now_utc().strftime('%Y%m%d-%H%M')}-{str(author.id)[-4:]}"
         emb.set_footer(text=f"Appeal id {case_id}")
 
-        # send to staff channel
+        # post to appeals or modlog
         delivered = False
         try:
             ch = bot.get_channel(ch_id) or await bot.fetch_channel(ch_id)
@@ -522,23 +535,50 @@ async def appeal(ctx: commands.Context):
         except Exception as e:
             print("[appeal] post failed,", repr(e))
 
-        # confirm to the user
-        try:
+        with contextlib.suppress(Exception):
             if delivered:
                 await author.send(f"Thanks, your appeal was sent to the moderators. Case id, {case_id}.")
             else:
                 extra = f" You can also join our appeals server, {APPEALS_JOIN_INVITE}" if APPEALS_JOIN_INVITE else ""
                 await author.send("Thanks, your appeal was recorded, but I could not post it to the staff channel." + extra)
-        except Exception:
-            pass
 
-        # if the command was used in a server channel, acknowledge there too
         if ctx.guild is not None:
             with contextlib.suppress(Exception):
-                await ctx.reply("I DMd you the appeal questions. Check your DMs.")
+                await ctx.reply("I DMd you the appeal questions, check your DMs.")
 
     finally:
         _APPEAL_BUSY.discard(author.id)
+
+
+async def lookup_known_ban(user_id: int) -> Optional[dict]:
+    """
+    Returns a dict with guild_id, guild_name, reason, when, unbanned, or None.
+    Looks in storage first, then tries guild.fetch_ban where possible.
+    """
+    data = load_bans()
+    recs = data.get(str(user_id), [])
+    for rec in reversed(recs):
+        if not rec.get("unbanned", False):
+            return rec
+
+    # fallback, light scan of guilds where the bot can see bans
+    try:
+        user_obj = await bot.fetch_user(user_id)
+    except Exception:
+        user_obj = discord.Object(id=user_id)  # type: ignore
+
+    for g in bot.guilds:
+        with contextlib.suppress(Exception):
+            ban_entry = await g.fetch_ban(user_obj)  # needs Ban Members permission
+            return {
+                "guild_id": g.id,
+                "guild_name": g.name,
+                "reason": ban_entry.reason or "No reason recorded",
+                "when": now_utc().isoformat(),
+                "unbanned": False,
+            }
+    return None
+
 
 
 
@@ -746,6 +786,18 @@ async def ban(ctx: commands.Context, member: discord.Member, *, reason: Optional
     note = "DM sent" if dm_ok else "DM could not be delivered"
     await ctx.reply(f"Banned {member} , {note}.")
     await send_modlog(ctx, "Ban", member, msg, extra=note)
+    # inside ban, after you send the modlog
+    bans = load_bans()
+    bans.setdefault(str(member.id), []).append({
+    "guild_id": ctx.guild.id,
+    "guild_name": ctx.guild.name,
+    "moderator_id": ctx.author.id,
+    "reason": msg,
+    "when": now_utc().isoformat(),
+    "unbanned": False,
+})
+    save_bans(bans)
+
 
 @bot.command(usage="user_id reason", help="Unban a user by id, then DM if possible.")
 @commands.has_permissions(ban_members=True)
@@ -773,6 +825,16 @@ async def unban(ctx: commands.Context, user_id: int, *, reason: Optional[str] = 
     note = "DM sent" if dm_ok else "DM could not be delivered"
     await ctx.reply(f"Unbanned user id {user_id} , {note}.")
     await send_modlog(ctx, "Unban", user_obj, text, extra=note)
+    # inside unban, after you send the modlog
+    bans = load_bans()
+    recs = bans.get(str(user_id), [])
+    for rec in reversed(recs):
+        if rec.get("guild_id") == ctx.guild.id and not rec.get("unbanned", False):
+            rec["unbanned"] = True
+        rec["unbanned_at"] = now_utc().isoformat()
+        break
+    save_bans(bans)
+
 
 @bot.command(usage="@user reason", help="Kick a user, then DM them the reason.")
 @commands.has_permissions(kick_members=True)
