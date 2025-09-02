@@ -220,8 +220,20 @@ intents.members = True
 
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None)
 
-# label this running copy
+# label this process
 INSTANCE = os.getenv("BOT_INSTANCE", "unknown")
+# only this label is allowed to handle commands, set this env var on the service you keep
+ALLOWED_INSTANCE = os.getenv("ALLOWED_INSTANCE", "")
+
+@bot.check_once
+async def single_instance_gate(_ctx):
+    # if ALLOWED_INSTANCE is set, only that instance may handle commands
+    return not ALLOWED_INSTANCE or INSTANCE == ALLOWED_INSTANCE
+
+@bot.command()
+async def instance(ctx):
+    await ctx.reply(f"Instance, {INSTANCE}")
+
 
 
 
