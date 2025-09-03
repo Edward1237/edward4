@@ -81,24 +81,59 @@ col_bans = None        # one doc per ban or unban event
 _storage_ready = asyncio.Event()
 
 async def mongo_connect():
+    """
+    Connect to MongoDB and set up collections and indexes.
+    Works whether your MONGODB_URI includes a database name or not.
+    """
+    from motor.motor_asyncio import AsyncIOMotorClient
+    from pymongo.errors import ConfigurationError
+
     global mongo_client, mongo_db, col_configs, col_warnings, col_tickets, col_optins, col_bans
+
     if not MONGODB_URI:
         print("[mongo] missing MONGODB_URI")
+        _storage_ready.set()
         return
+
     mongo_client = AsyncIOMotorClient(MONGODB_URI, uuidRepresentation="standard")
-    mongo_db = mongo_client.get_default_database() or mongo_client["edwardbot"]
-    col_configs = mongo_db["configs"]
-    col_warnings = mongo_db["warnings"]
-    col_tickets = mongo_db["tickets"]
-    col_optins = mongo_db["dm_optins"]
-    col_bans = mongo_db["bans"]
+
+    # Try to get the default database from the URI, if not present fall back to a named one
+    db = None
+    try:
+        db = mongo_client.get_default_database()
+    except ConfigurationError:
+        db = None
+    except Exception:
+        db = None
+    if db is None:
+        db = mongo_client["edwardbot"]  # change this name if you want a different database
+
+    mongo_db = db
+
+    # Optional connectivity check
+    try:
+        await mongo_db.command("ping")
+        print("[mongo] ping ok")
+    except Exception as e:
+        print(f"[mongo] ping failed, {e}")
+
+    # Collections
+    col_configs = mongo_db["configs"]     # one doc per guild
+    col_warnings = mongo_db["warnings"]   # one doc per warning
+    col_tickets = mongo_db["tickets"]     # one doc per ticket channel
+    col_optins = mongo_db["dm_optins"]    # one doc per guild, list of user ids
+    col_bans = mongo_db["bans"]           # one doc per ban or unban event
+
+    # Indexes
     await col_configs.create_index([("guild_id", 1)], unique=True)
     await col_warnings.create_index([("guild_id", 1), ("user_id", 1), ("timestamp", 1)])
     await col_tickets.create_index([("channel_id", 1)], unique=True)
     await col_optins.create_index([("guild_id", 1)], unique=True)
     await col_bans.create_index([("user_id", 1), ("guild_id", 1), ("when", -1)])
-    print("[mongo] connected, indexes ensured")
+
+    print("[mongo] connected and indexes ensured")
     _storage_ready.set()
+
 
 # ========= Small helpers =========
 def now_utc() -> datetime:
